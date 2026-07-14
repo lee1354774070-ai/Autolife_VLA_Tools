@@ -17,6 +17,11 @@ the latest measured joint state, so the policy cannot move those groups.
 This file intentionally uses the collector's direct SHM reader instead of the
 ROS image bridge. That removes an extra serialization hop while retaining the
 same metadata-consistency checks used during recording.
+
+By default the policy receives the three RGB features used by the current
+collector: ``rgbd_head_color``, ``hand_left``, and ``hand_right``. Depth and
+the optional head/waist joint groups are enabled explicitly with command-line
+switches so one deployer can serve all matching PI0.5 checkpoints.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +56,12 @@ for import_dir in (REPO_DIR, COLLECTOR_DIR):
     if str(import_dir) not in sys.path:
         sys.path.insert(0, str(import_dir))
 
-from camera_config import CAMERA_SPECS, CameraSpec  # noqa: E402
+from camera_config import (  # noqa: E402
+    CAMERA_SPECS,
+    DEFAULT_DEPTH_CAMERA_NAMES,
+    DEFAULT_RGB_CAMERA_NAMES,
+    CameraSpec,
+)
 from cli_help import show_requested_parameter_help  # noqa: E402
 from robot_schema import RobotSchema, build_robot_schema  # noqa: E402
 from shm_camera import read_shm_frame, read_shm_metadata, shm_timestamp_sec  # noqa: E402
@@ -60,8 +71,13 @@ WHOLE_BODY_DIM = 23
 BASE_POLICY_DIM = 16
 HEAD_DIM = 3
 WAIST_DIM = 4
-MODEL_IMAGE_KEY = "observation.images.rgbd_head_color"
-MODEL_IMAGE_SHAPE = (3, 480, 640)
+DEFAULT_RGB_SHAPE = (3, 480, 640)
+DEFAULT_DEPTH_SHAPE = (1, 480, 640)
+DEFAULT_SYNC_REFERENCE_CAMERA = "hand_left"
+DEFAULT_MAX_IMAGE_DELTA_SEC = 0.04
+DEFAULT_DEPTH_MIN = 0.05
+DEFAULT_DEPTH_MAX = 10.0
+DEFAULT_DEPTH_SHIFT = 3.5
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -85,12 +101,6 @@ def default_robot_id() -> str:
 
 def topic_id() -> str:
     return f"{os.getenv('ROS_DOMAIN_ID', '0')}_{default_robot_id()}"
-
-
-def expected_policy_dim(with_head: bool, with_waist: bool) -> int:
-    """Return the collector schema size in canonical policy order."""
-
-    return BASE_POLICY_DIM + (HEAD_DIM if with_head else 0) + (WAIST_DIM if with_waist else 0)
 
 
 def flatten_joint_positions(packet: dict[str, Any]) -> np.ndarray | None:
@@ -129,7 +139,7 @@ def policy_state_from_q23(q23: np.ndarray, schema: RobotSchema) -> np.ndarray:
         raise ValueError(f"Expected {WHOLE_BODY_DIM} physical joints, got {q.size}.")
 
     values = [*q[4:11], *q[11:18], q[18], q[19]]
-    if schema.groups[-1].name == "head" or any(group.name == "head" for group in schema.groups):
+    if any(group.name == "head" for group in schema.groups):
         values.extend(q[20:23])
     if any(group.name == "waist" for group in schema.groups):
         values.extend(q[:4])
@@ -162,8 +172,8 @@ def physical_q23_from_action(action: np.ndarray, latest_q23: np.ndarray, schema:
     return q
 
 
-def image_to_policy_chw(image: np.ndarray) -> np.ndarray:
-    """Convert a BGR SHM image into the PI0.5 RGB uint8 CHW contract."""
+def image_to_policy_chw(image: np.ndarray, target_shape: tuple[int, int, int]) -> np.ndarray:
+    """Convert a BGR SHM image into a normalized RGB CHW policy input."""
 
     if image.dtype != np.uint8:
         image = np.asarray(image)
@@ -178,16 +188,58 @@ def image_to_policy_chw(image: np.ndarray) -> np.ndarray:
     if image.ndim != 3 or image.shape[2] not in (3, 4):
         raise ValueError(f"Expected a BGR image with 3 channels, got shape {image.shape}.")
     image = image[..., :3]
-    image = cv2.resize(image, (MODEL_IMAGE_SHAPE[2], MODEL_IMAGE_SHAPE[1]), interpolation=cv2.INTER_AREA)
+    image = cv2.resize(image, (target_shape[2], target_shape[1]), interpolation=cv2.INTER_AREA)
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     chw = np.ascontiguousarray(image.transpose(2, 0, 1))
-    if chw.shape != MODEL_IMAGE_SHAPE:
-        raise ValueError(f"Image has shape {chw.shape}, expected {MODEL_IMAGE_SHAPE}.")
+    if chw.shape != target_shape:
+        raise ValueError(f"Image has shape {chw.shape}, expected {target_shape}.")
     return chw
 
 
+def depth_to_policy_chw(
+    depth_hwc: np.ndarray,
+    target_shape: tuple[int, int, int],
+    depth_min: float,
+    depth_max: float,
+    depth_shift: float,
+    depth_use_log: bool,
+) -> np.ndarray:
+    """Quantize live millimetre depth like LeRobot's native depth video path.
+
+    The collector stores physical depth as uint16 millimetres. LeRobot 0.6
+    quantizes that stream to uint12 codes for video, so deployment must apply
+    the same conversion before passing a depth feature to the policy.
+    """
+
+    depth = np.asarray(depth_hwc)
+    if depth.ndim == 3 and depth.shape[2] == 1:
+        depth = depth[:, :, 0]
+    if depth.ndim != 2:
+        raise ValueError(f"Expected a single-channel depth map, got shape {depth.shape}.")
+    depth = cv2.resize(depth, (target_shape[2], target_shape[1]), interpolation=cv2.INTER_NEAREST)
+    try:
+        from lerobot.datasets.video_utils import quantize_depth
+
+        quantized = quantize_depth(
+            depth.astype(np.uint16, copy=False),
+            depth_min=depth_min,
+            depth_max=depth_max,
+            shift=depth_shift,
+            use_log=depth_use_log,
+            video_backend=None,
+            input_unit="mm",
+        )
+        quantized = np.asarray(quantized, dtype=np.float32)
+    except ImportError as exc:
+        raise RuntimeError("Depth deployment requires LeRobot 0.6 video_utils.quantize_depth.") from exc
+    result = np.ascontiguousarray(quantized[None, ...])
+    if result.shape != target_shape:
+        raise ValueError(f"Depth has shape {result.shape}, expected {target_shape}.")
+    return result
+
+
 def load_policy(model_dir: Path, device: str):
-    """Load PI0.5 with the public LeRobot API used by the 004500 checkpoint."""
+    """Load a LeRobot PI0.5 policy and its saved feature contract."""
 
     try:
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
@@ -203,23 +255,44 @@ def load_policy(model_dir: Path, device: str):
     return policy
 
 
-def read_model_contract(model_dir: Path) -> tuple[int | None, int | None, tuple[int, ...] | None]:
-    """Read dimensions from config.json before touching the robot controller."""
+def read_model_contract(
+    model_dir: Path,
+) -> tuple[int | None, int | None, dict[str, tuple[int, ...]], list[str] | None]:
+    """Read state/action/image features before touching the robot controller."""
 
     config_path = model_dir / "config.json"
     if not config_path.exists():
-        return None, None, None
+        return None, None, {}, None
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
         input_shape = config.get("input_features", {}).get("observation.state", {}).get("shape")
         action_shape = config.get("output_features", {}).get("action", {}).get("shape")
-        image_shape = config.get("input_features", {}).get(MODEL_IMAGE_KEY, {}).get("shape")
+        input_features = config.get("input_features", {})
+        image_shapes = {
+            key: tuple(int(value) for value in feature.get("shape", []))
+            for key, feature in input_features.items()
+            if key.startswith("observation.images.") and feature.get("shape")
+        }
+        action_feature_names = config.get("action_feature_names")
+        if not isinstance(action_feature_names, list):
+            action_feature_names = None
         state_dim = int(input_shape[0]) if isinstance(input_shape, list) and input_shape else None
         action_dim = int(action_shape[0]) if isinstance(action_shape, list) and action_shape else None
-        parsed_image_shape = tuple(int(value) for value in image_shape) if image_shape else None
-        return state_dim, action_dim, parsed_image_shape
+        return state_dim, action_dim, image_shapes, action_feature_names
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise ValueError(f"Could not parse model contract: {config_path}: {exc}") from exc
+
+
+def normalize_policy_image_shape(shape: tuple[int, ...], camera_name: str) -> tuple[int, int, int]:
+    """Normalize a LeRobot visual feature shape to channel-first order."""
+
+    if len(shape) != 3:
+        raise ValueError(f"Model feature observation.images.{camera_name} must be 3-D, got {shape}.")
+    if shape[0] in (1, 3):
+        return shape
+    if shape[-1] in (1, 3):
+        return (shape[-1], shape[0], shape[1])
+    raise ValueError(f"Model feature observation.images.{camera_name} has no 1/3-channel dimension: {shape}.")
 
 
 class JointTelemetryNode(Node):
@@ -301,35 +374,106 @@ class AutoLifeCommandNode(Node):
         self.gripper_publisher.publish(grippers)
 
 
+@dataclass(frozen=True)
+class ShmImage:
+    """One decoded source image plus the timestamp used for multi-camera sync."""
+
+    name: str
+    image_hwc: np.ndarray
+    stamp_sec: float
+    received_sec: float
+    is_depth: bool
+
+
 class DirectShmCamera:
     """Read only new, internally consistent frames from one camera's SHM ABI."""
 
-    def __init__(self, spec: CameraSpec) -> None:
+    def __init__(self, spec: CameraSpec, is_depth: bool) -> None:
         self.spec = spec
+        self.is_depth = is_depth
         self.last_timestamp_ns: int | None = None
-        self.latest_received_sec = 0.0
 
-    def read_latest(self) -> np.ndarray | None:
-        metadata = read_shm_metadata(self.spec)
-        if metadata is None:
-            return None
+    def read_latest(self, metadata: tuple[int, int, int, int, int, int]) -> ShmImage | None:
         if self.last_timestamp_ns == metadata[0]:
             return None
         frame = read_shm_frame(self.spec, metadata)
         if frame is None or frame.timestamp_ns != metadata[0]:
             return None
-        if frame.pixel_format != 1 or frame.channels != 3:
-            raise ValueError(
-                f"{self.spec.name} must be pixel_format=1/channels=3, "
-                f"got {frame.pixel_format}/{frame.channels}"
-            )
-        bgr = np.frombuffer(frame.data, dtype=np.uint8).reshape(frame.height, frame.width, 3)
+        if self.is_depth:
+            if frame.pixel_format != 2 or frame.channels != 1:
+                raise ValueError(
+                    f"{self.spec.name} must be pixel_format=2/channels=1, "
+                    f"got {frame.pixel_format}/{frame.channels}"
+                )
+            image = np.frombuffer(frame.data, dtype="<u2").reshape(frame.height, frame.width, 1).copy()
+        else:
+            if frame.pixel_format != 1 or frame.channels != 3:
+                raise ValueError(
+                    f"{self.spec.name} must be pixel_format=1/channels=3, "
+                    f"got {frame.pixel_format}/{frame.channels}"
+                )
+            image = np.frombuffer(frame.data, dtype=np.uint8).reshape(frame.height, frame.width, 3).copy()
         self.last_timestamp_ns = frame.timestamp_ns
-        self.latest_received_sec = time.time()
-        # The timestamp is intentionally evaluated here as a diagnostic hook:
-        # current robot SHM timestamps may be device/monotonic values.
-        shm_timestamp_sec(frame.timestamp_ns, self.latest_received_sec)
-        return np.ascontiguousarray(bgr)
+        received_sec = time.time()
+        return ShmImage(
+            name=self.spec.name,
+            image_hwc=np.ascontiguousarray(image),
+            stamp_sec=shm_timestamp_sec(frame.timestamp_ns, received_sec),
+            received_sec=received_sec,
+            is_depth=self.is_depth,
+        )
+
+
+class DirectShmCameraSet:
+    """Batch-poll selected cameras and keep their newest timestamped frames."""
+
+    def __init__(self, camera_names: tuple[str, ...], depth_names: set[str]) -> None:
+        self.camera_names = camera_names
+        self.cameras = {
+            name: DirectShmCamera(CAMERA_SPECS[name], name in depth_names)
+            for name in camera_names
+        }
+        self.latest: dict[str, ShmImage] = {}
+
+    def refresh(self) -> None:
+        # Snapshot all metadata before copying any large image buffer, matching
+        # the collector's metadata-batch read strategy.
+        metadata_by_name = {}
+        for name in self.camera_names:
+            metadata = read_shm_metadata(self.cameras[name].spec)
+            if metadata is not None:
+                metadata_by_name[name] = metadata
+        for name in self.camera_names:
+            camera = self.cameras[name]
+            metadata = metadata_by_name.get(name)
+            if metadata is None or camera.last_timestamp_ns == metadata[0]:
+                continue
+            image = camera.read_latest(metadata)
+            if image is not None:
+                self.latest[name] = image
+
+    def synchronized_latest(
+        self,
+        reference_name: str,
+        max_delta_sec: float,
+        max_age_sec: float,
+    ) -> dict[str, ShmImage] | None:
+        if reference_name not in self.latest or any(name not in self.latest for name in self.camera_names):
+            return None
+        reference = self.latest[reference_name]
+        now = time.time()
+        selected: dict[str, ShmImage] = {}
+        for name in self.camera_names:
+            image = self.latest[name]
+            if now - image.received_sec > max_age_sec:
+                return None
+            if abs(image.stamp_sec - reference.stamp_sec) > max_delta_sec:
+                return None
+            selected[name] = image
+        return selected
+
+    def close(self) -> None:
+        """Keep a symmetric lifecycle API for future SHM resource handles."""
 
 
 class LocalPI05Deployer:
@@ -347,20 +491,47 @@ class LocalPI05Deployer:
         self.executor: MultiThreadedExecutor | None = None
         self.spin_thread: threading.Thread | None = None
 
-        contract_state, contract_action, contract_image = read_model_contract(args.model_dir)
+        contract_state, contract_action, contract_images, contract_action_names = read_model_contract(args.model_dir)
         expected_dim = self.schema.size
         if contract_state is not None and contract_state != expected_dim:
             raise ValueError(
                 f"Model expects observation.state={contract_state} dims, but the selected "
                 f"head/waist switches produce {expected_dim}. Use the switches used during training."
             )
-        if contract_action is not None and contract_action < expected_dim:
+        if contract_action is not None and contract_action != expected_dim:
             raise ValueError(
                 f"Model action has {contract_action} dims, but the selected schema needs {expected_dim}."
             )
-        if contract_image is not None and contract_image != MODEL_IMAGE_SHAPE:
-            raise ValueError(
-                f"Model image shape is {contract_image}, but this deployer supplies {MODEL_IMAGE_SHAPE}."
+        expected_camera_names = tuple(args.camera_names)
+        expected_image_keys = {f"observation.images.{name}" for name in expected_camera_names}
+        if contract_images:
+            model_image_keys = set(contract_images)
+            if model_image_keys != expected_image_keys:
+                missing = sorted(expected_image_keys - model_image_keys)
+                unexpected = sorted(model_image_keys - expected_image_keys)
+                details = []
+                if missing:
+                    details.append("missing=" + ",".join(missing))
+                if unexpected:
+                    details.append("unexpected=" + ",".join(unexpected))
+                raise ValueError(
+                    "Selected cameras do not match model input features ("
+                    + "; ".join(details)
+                    + "). Use the cameras used during training or a matching checkpoint."
+                )
+            self.image_shapes = {
+                name: normalize_policy_image_shape(contract_images[f"observation.images.{name}"], name)
+                for name in expected_camera_names
+            }
+        else:
+            self.image_shapes = {
+                name: DEFAULT_DEPTH_SHAPE if name in args.depth_camera_names else DEFAULT_RGB_SHAPE
+                for name in expected_camera_names
+            }
+        if contract_action_names and tuple(contract_action_names[:expected_dim]) != self.schema.names:
+            print(
+                "Warning: model action labels differ from collector canonical names; "
+                "deployment preserves the trained array order."
             )
 
         rclpy.init(args=None)
@@ -372,15 +543,15 @@ class LocalPI05Deployer:
         self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
         self.spin_thread.start()
 
-        camera_name = args.camera
-        self.camera = DirectShmCamera(CAMERA_SPECS[camera_name])
-        self.latest_image_chw: np.ndarray | None = None
+        self.camera_set = DirectShmCameraSet(tuple(args.camera_names), set(args.depth_camera_names))
+        self.latest_images: dict[str, np.ndarray] = {}
         self.latest_image_received_sec = 0.0
         self.policy = load_policy(args.model_dir, args.device)
 
         print(f"policy schema: {', '.join(self.schema.names)}")
         print(f"policy state/action dimensions: {expected_dim}/{contract_action or 'unknown'}")
-        print(f"camera source: SHM {camera_name} ({CAMERA_SPECS[camera_name].meta_path})")
+        print(f"camera inputs: {', '.join(args.camera_names)}")
+        print(f"camera source: direct SHM, reference={args.sync_reference_camera}")
 
     def close(self) -> None:
         self.stop_requested = True
@@ -395,6 +566,7 @@ class LocalPI05Deployer:
                     node.destroy_node()
                 except Exception:
                     pass
+        self.camera_set.close()
         try:
             rclpy.shutdown()
         except Exception:
@@ -403,17 +575,35 @@ class LocalPI05Deployer:
     def refresh(self) -> tuple[np.ndarray | None, float]:
         assert self.telemetry is not None
         q23, state_received_sec = self.telemetry.snapshot()
-        image = self.camera.read_latest()
-        if image is not None:
-            self.latest_image_chw = image_to_policy_chw(image)
-            self.latest_image_received_sec = self.camera.latest_received_sec
+        self.camera_set.refresh()
+        synchronized = self.camera_set.synchronized_latest(
+            self.args.sync_reference_camera,
+            self.args.max_image_delta_sec,
+            self.args.max_image_age_sec,
+        )
+        if synchronized is not None:
+            self.latest_images = {}
+            for name, image in synchronized.items():
+                shape = self.image_shapes[name]
+                if image.is_depth:
+                    self.latest_images[name] = depth_to_policy_chw(
+                        image.image_hwc,
+                        shape,
+                        self.args.depth_min,
+                        self.args.depth_max,
+                        self.args.depth_shift,
+                        self.args.depth_use_log,
+                    )
+                else:
+                    self.latest_images[name] = image_to_policy_chw(image.image_hwc, shape)
+            self.latest_image_received_sec = max(image.received_sec for image in synchronized.values())
         return q23, state_received_sec
 
     def wait_until_ready(self) -> None:
         deadline = time.monotonic() + self.args.warmup_sec
         while not self.stop_requested and time.monotonic() < deadline:
             q23, state_received_sec = self.refresh()
-            image_ready = self.latest_image_chw is not None
+            image_ready = len(self.latest_images) == len(self.args.camera_names)
             state_ready = q23 is not None
             if state_ready and image_ready:
                 print("Ready: joint state and camera frame are available.")
@@ -422,19 +612,26 @@ class LocalPI05Deployer:
         missing = []
         if self.telemetry is None or self.telemetry.latest_q23 is None:
             missing.append(f"joint state on {self.joints_topic}")
-        if self.latest_image_chw is None:
-            missing.append(f"camera {self.args.camera}")
+        missing_cameras = [name for name in self.args.camera_names if name not in self.latest_images]
+        if missing_cameras:
+            missing.append("cameras " + ", ".join(missing_cameras))
         raise TimeoutError(f"Timed out waiting for: {', '.join(missing)}")
 
     def build_observation(self, q23: np.ndarray) -> dict[str, Any]:
-        if self.latest_image_chw is None:
-            raise RuntimeError("Camera observation is not ready.")
+        missing = [name for name in self.args.camera_names if name not in self.latest_images]
+        if missing:
+            raise RuntimeError("Camera observations are not ready: " + ", ".join(missing))
         state = policy_state_from_q23(q23, self.schema)
-        return {
+        observation: dict[str, Any] = {
             "observation.state": torch.from_numpy(state),
-            MODEL_IMAGE_KEY: torch.from_numpy(self.latest_image_chw.astype(np.float32) / 255.0),
             "task": self.args.task,
         }
+        for name in self.args.camera_names:
+            image = self.latest_images[name]
+            if name not in self.args.depth_camera_names:
+                image = image.astype(np.float32, copy=False) / 255.0
+            observation[f"observation.images.{name}"] = torch.from_numpy(image)
+        return observation
 
     def select_action(self, q23: np.ndarray) -> np.ndarray:
         assert self.policy is not None
@@ -478,7 +675,7 @@ class LocalPI05Deployer:
             loop_started = time.monotonic()
             q23, state_received_sec = self.refresh()
             now = time.time()
-            if q23 is None or self.latest_image_chw is None:
+            if q23 is None or len(self.latest_images) != len(self.args.camera_names):
                 time.sleep(0.002)
                 continue
             if now - state_received_sec > self.args.max_state_age_sec:
@@ -510,15 +707,15 @@ class LocalPI05Deployer:
 
 
 def parse_args() -> argparse.Namespace:
-    repo_default = REPO_DIR / "004500" / "pretrained_model"
+    repo_default = Path(os.getenv("MODEL_DIR", str(REPO_DIR / "004500" / "pretrained_model")))
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  deploy_pi05_004500.py --model-dir /home/ubuntu/004500/pretrained_model --task 'pick up the bottle'\n"
-            "  deploy_pi05_004500.py --with-head --with-waist --dry-run --max-steps 30\n"
-            "  deploy_pi05_004500.py --with-head --help"
+            "  deploy_pi05.py --model-dir /home/ubuntu/004500/pretrained_model --task 'pick up the bottle'\n"
+            "  deploy_pi05.py --with-head --with-waist --with-depth --dry-run --max-steps 30\n"
+            "  deploy_pi05.py --with-head --help"
         ),
     )
     parser.add_argument("--model-dir", type=Path, default=repo_default, help="Local LeRobot pretrained_model directory to load.")
@@ -528,7 +725,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=0, help="Maximum inference steps; 0 runs until Ctrl-C.")
     parser.add_argument("--warmup-sec", type=float, default=10.0, help="Maximum time to wait for a complete joint state and camera frame.")
     parser.add_argument("--start-delay-sec", type=float, default=3.0, help="Delay after readiness before commands are published, allowing the operator to cancel.")
-    parser.add_argument("--camera", choices=sorted(CAMERA_SPECS), default="rgbd_head_color", help="SHM RGB camera used as the PI0.5 visual observation.")
+    parser.add_argument(
+        "--camera",
+        dest="camera_names",
+        action="append",
+        choices=sorted(DEFAULT_RGB_CAMERA_NAMES),
+        default=None,
+        help="RGB SHM camera feature to provide. Repeat to select a subset; default is rgbd_head_color, hand_left, and hand_right.",
+    )
+    parser.add_argument(
+        "--with-depth",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("WITH_DEPTH", False),
+        help="Append the rgbd_head_depth observation.images feature and quantize live uint16 millimetre depth like the collector.",
+    )
+    parser.add_argument(
+        "--depth-camera",
+        dest="depth_camera_names",
+        action="append",
+        choices=sorted(DEFAULT_DEPTH_CAMERA_NAMES),
+        default=None,
+        help="Depth SHM camera feature to provide. Repeat for multiple depth cameras; implies --with-depth.",
+    )
     parser.add_argument("--joints-topic", default=None, help="Override the complete physical q23 joint-state ROS2 topic.")
     parser.add_argument("--dry-run", action="store_true", help="Run inference without publishing arm, gripper, head, or waist commands.")
     parser.add_argument(
@@ -541,6 +759,27 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction, default=env_bool("WITH_WAIST", False),
         help="Include leg_ankle, leg_knee, waist_pitch, and waist_yaw in the policy state/action and publish their predicted commands.",
     )
+    parser.add_argument(
+        "--sync-reference-camera",
+        choices=sorted(CAMERA_SPECS),
+        default=os.getenv("SYNC_REFERENCE_CAMERA", DEFAULT_SYNC_REFERENCE_CAMERA),
+        help="Camera timestamp anchor for the multi-camera observation; it must be selected in the active camera list.",
+    )
+    parser.add_argument(
+        "--max-image-delta-sec",
+        type=float,
+        default=float(os.getenv("MAX_IMAGE_DELTA_SEC", DEFAULT_MAX_IMAGE_DELTA_SEC)),
+        help="Maximum timestamp difference between selected camera frames in one observation.",
+    )
+    parser.add_argument("--depth-min", type=float, default=DEFAULT_DEPTH_MIN, help="Minimum depth range in metres, matching collector encoding.")
+    parser.add_argument("--depth-max", type=float, default=DEFAULT_DEPTH_MAX, help="Maximum depth range in metres, matching collector encoding.")
+    parser.add_argument("--depth-shift", type=float, default=DEFAULT_DEPTH_SHIFT, help="Logarithmic depth shift in metres, matching collector encoding.")
+    parser.add_argument(
+        "--depth-use-log",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use logarithmic depth quantization, matching the collector default.",
+    )
     parser.add_argument("--gripper-int", action=argparse.BooleanOptionalAction, default=True, help="Round gripper targets to integer values before publishing; use --no-gripper-int for floating-point values.")
     parser.add_argument("--max-state-age-sec", type=float, default=0.20, help="Reject inference when the newest joint state is older than this many seconds.")
     parser.add_argument("--max-image-age-sec", type=float, default=0.20, help="Reject inference when the newest camera frame is older than this many seconds.")
@@ -548,10 +787,32 @@ def parse_args() -> argparse.Namespace:
     show_requested_parameter_help(parser)
     args = parser.parse_args()
     args.model_dir = args.model_dir.expanduser().resolve()
+    args.camera_names = list(dict.fromkeys(args.camera_names or DEFAULT_RGB_CAMERA_NAMES))
+    args.depth_camera_names = list(dict.fromkeys(args.depth_camera_names or []))
+    if args.with_depth and not args.depth_camera_names:
+        args.depth_camera_names = list(DEFAULT_DEPTH_CAMERA_NAMES)
+    if args.depth_camera_names:
+        args.with_depth = True
+    for name in args.depth_camera_names:
+        if name in args.camera_names:
+            raise SystemExit(f"Camera {name} cannot be both RGB and depth.")
+    args.camera_names.extend(name for name in args.depth_camera_names if name not in args.camera_names)
+    if args.sync_reference_camera not in args.camera_names:
+        raise SystemExit(
+            f"--sync-reference-camera {args.sync_reference_camera!r} is not active. "
+            f"Active cameras: {', '.join(args.camera_names)}"
+        )
     if not args.model_dir.is_dir():
         raise SystemExit(f"Model directory does not exist: {args.model_dir}")
-    if args.hz <= 0 or args.max_state_age_sec <= 0 or args.max_image_age_sec <= 0:
-        raise SystemExit("--hz and freshness limits must be positive.")
+    if (
+        args.hz <= 0
+        or args.max_state_age_sec <= 0
+        or args.max_image_age_sec <= 0
+        or args.max_image_delta_sec <= 0
+        or args.depth_min < 0
+        or args.depth_max <= args.depth_min
+    ):
+        raise SystemExit("hz, freshness limits, image delta, and depth range must be positive and valid.")
     return args
 
 
