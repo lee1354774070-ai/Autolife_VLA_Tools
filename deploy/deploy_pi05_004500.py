@@ -51,6 +51,7 @@ for import_dir in (REPO_DIR, COLLECTOR_DIR):
         sys.path.insert(0, str(import_dir))
 
 from camera_config import CAMERA_SPECS, CameraSpec  # noqa: E402
+from cli_help import show_requested_parameter_help  # noqa: E402
 from robot_schema import RobotSchema, build_robot_schema  # noqa: E402
 from shm_camera import read_shm_frame, read_shm_metadata, shm_timestamp_sec  # noqa: E402
 
@@ -510,31 +511,41 @@ class LocalPI05Deployer:
 
 def parse_args() -> argparse.Namespace:
     repo_default = REPO_DIR / "004500" / "pretrained_model"
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", type=Path, default=repo_default)
-    parser.add_argument("--task", default="mango_pick")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--hz", type=float, default=10.0)
-    parser.add_argument("--max-steps", type=int, default=0, help="0 means run until Ctrl-C")
-    parser.add_argument("--warmup-sec", type=float, default=10.0)
-    parser.add_argument("--start-delay-sec", type=float, default=3.0)
-    parser.add_argument("--camera", choices=sorted(CAMERA_SPECS), default="rgbd_head_color")
-    parser.add_argument("--joints-topic", default=None)
-    parser.add_argument("--dry-run", action="store_true", help="Infer without publishing commands")
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  deploy_pi05_004500.py --model-dir /home/ubuntu/004500/pretrained_model --task 'pick up the bottle'\n"
+            "  deploy_pi05_004500.py --with-head --with-waist --dry-run --max-steps 30\n"
+            "  deploy_pi05_004500.py --with-head --help"
+        ),
+    )
+    parser.add_argument("--model-dir", type=Path, default=repo_default, help="Local LeRobot pretrained_model directory to load.")
+    parser.add_argument("--task", default="mango_pick", help="Natural-language task prompt passed to the PI0.5 tokenizer.")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used for policy inference, such as cuda or cpu.")
+    parser.add_argument("--hz", type=float, default=10.0, help="Robot command publication and inference loop frequency in Hz.")
+    parser.add_argument("--max-steps", type=int, default=0, help="Maximum inference steps; 0 runs until Ctrl-C.")
+    parser.add_argument("--warmup-sec", type=float, default=10.0, help="Maximum time to wait for a complete joint state and camera frame.")
+    parser.add_argument("--start-delay-sec", type=float, default=3.0, help="Delay after readiness before commands are published, allowing the operator to cancel.")
+    parser.add_argument("--camera", choices=sorted(CAMERA_SPECS), default="rgbd_head_color", help="SHM RGB camera used as the PI0.5 visual observation.")
+    parser.add_argument("--joints-topic", default=None, help="Override the complete physical q23 joint-state ROS2 topic.")
+    parser.add_argument("--dry-run", action="store_true", help="Run inference without publishing arm, gripper, head, or waist commands.")
     parser.add_argument(
         "--with-head", "--control-head", dest="with_head",
         action=argparse.BooleanOptionalAction, default=env_bool("WITH_HEAD", False),
-        help="Include neck joints in policy state/action and control them.",
+        help="Include neck_roll, neck_pitch, and neck_yaw in the policy state/action and publish their predicted commands.",
     )
     parser.add_argument(
         "--with-waist", "--control-waist", dest="with_waist",
         action=argparse.BooleanOptionalAction, default=env_bool("WITH_WAIST", False),
-        help="Include leg/waist joints in policy state/action and control them.",
+        help="Include leg_ankle, leg_knee, waist_pitch, and waist_yaw in the policy state/action and publish their predicted commands.",
     )
-    parser.add_argument("--gripper-int", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--max-state-age-sec", type=float, default=0.20)
-    parser.add_argument("--max-image-age-sec", type=float, default=0.20)
-    parser.add_argument("--print-every", type=int, default=10)
+    parser.add_argument("--gripper-int", action=argparse.BooleanOptionalAction, default=True, help="Round gripper targets to integer values before publishing; use --no-gripper-int for floating-point values.")
+    parser.add_argument("--max-state-age-sec", type=float, default=0.20, help="Reject inference when the newest joint state is older than this many seconds.")
+    parser.add_argument("--max-image-age-sec", type=float, default=0.20, help="Reject inference when the newest camera frame is older than this many seconds.")
+    parser.add_argument("--print-every", type=int, default=10, help="Print one inference timing/status line every N steps.")
+    show_requested_parameter_help(parser)
     args = parser.parse_args()
     args.model_dir = args.model_dir.expanduser().resolve()
     if not args.model_dir.is_dir():

@@ -24,6 +24,36 @@ The default dataset path is:
 /home/ubuntu/nas14/<task_name>/dataset/
 ```
 
+## 1.1 View parameter help
+
+Show all launcher environment variables:
+
+```bash
+bash ./start_lerobot_official_collect.sh --help
+```
+
+Show one launcher variable:
+
+```bash
+bash ./start_lerobot_official_collect.sh --help MAX_SYNC_DELTA_SEC
+bash ./start_lerobot_official_collect.sh MAX_SYNC_DELTA_SEC --help
+```
+
+Show all recorder command-line options:
+
+```bash
+python ./record_lerobot_official.py --help
+```
+
+Show one recorder option:
+
+```bash
+python ./record_lerobot_official.py --max-sync-delta-sec --help
+python ./record_lerobot_official.py --with-depth --help
+```
+
+Single-option help does not require other mandatory arguments and never starts recording.
+
 Change the storage root with:
 
 ```bash

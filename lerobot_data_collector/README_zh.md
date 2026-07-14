@@ -23,6 +23,36 @@ bash ./start_lerobot_official_collect.sh pick_up_water_bottle
 /home/ubuntu/nas14/<task_name>/dataset/
 ```
 
+## 1.1 查看参数帮助
+
+查看启动脚本的全部环境变量说明：
+
+```bash
+bash ./start_lerobot_official_collect.sh --help
+```
+
+只查看某一个环境变量：
+
+```bash
+bash ./start_lerobot_official_collect.sh --help MAX_SYNC_DELTA_SEC
+bash ./start_lerobot_official_collect.sh MAX_SYNC_DELTA_SEC --help
+```
+
+查看底层录制器的全部命令行参数：
+
+```bash
+python ./record_lerobot_official.py --help
+```
+
+只查看一个录制器参数：
+
+```bash
+python ./record_lerobot_official.py --max-sync-delta-sec --help
+python ./record_lerobot_official.py --with-depth --help
+```
+
+单参数帮助不要求提供其他必填参数，也不会启动录制。
+
 修改保存位置：
 
 ```bash

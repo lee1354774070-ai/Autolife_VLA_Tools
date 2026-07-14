@@ -69,6 +69,7 @@ from camera_config import (
     DEFAULT_SYNC_SIGNAL_BUFFER_SIZE,
 )
 from robot_schema import RobotSchema, build_robot_schema, parse_gripper_command
+from cli_help import show_requested_parameter_help
 from shm_camera import ShmFrame, read_shm_frame, read_shm_metadata, shm_timestamp_sec
 from time_sync import (
     bracketing_samples,
@@ -1478,94 +1479,151 @@ def safe_repo_id(value: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, required=True, help="Dataset root. Existing roots are resumed.")
-    parser.add_argument("--repo-id", default=None, help="LeRobot repo id, e.g. local/mango_pick.")
-    parser.add_argument("--task-name", default="mango_pick", help="Task text written into the dataset, e.g. 'pick the mango'.")
-    parser.add_argument("--robot-type", default="autolife_s1")
-    parser.add_argument("--fps", type=int, default=30)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  record_lerobot_official.py --output-dir /tmp/dataset --task-name 'pick up the bottle'\n"
+            "  record_lerobot_official.py --output-dir /tmp/dataset --with-head --with-waist --with-depth\n"
+            "  record_lerobot_official.py --max-sync-delta-sec --help"
+        ),
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, required=True,
+        help="Root directory of the LeRobotDataset. Existing metadata and episodes are resumed.",
+    )
+    parser.add_argument(
+        "--repo-id", default=None,
+        help="Dataset repository identifier stored in metadata. If omitted, derive local/<output-name>.",
+    )
+    parser.add_argument(
+        "--task-name", default="mango_pick",
+        help="Natural-language task instruction written into every frame, for example 'pick up the bottle'.",
+    )
+    parser.add_argument(
+        "--robot-type", default="autolife_s1",
+        help="Robot type label stored in LeRobot metadata; it does not change ROS topics.",
+    )
+    parser.add_argument(
+        "--fps", type=int, default=30,
+        help="Target dataset frame rate. The reference camera supplies one frame anchor per tick.",
+    )
     parser.add_argument(
         "--image-source",
         choices=("shm", "ros"),
         default="shm",
-        help="Read images directly from shared memory (default) or subscribe to ROS topics.",
+        help="Image transport: 'shm' reads camera shared memory directly; 'ros' subscribes to bridge topics.",
     )
     parser.add_argument(
         "--image-poll-fps",
         type=float,
         default=DEFAULT_IMAGE_POLL_FPS,
-        help="Direct-SHM metadata polling rate; only new source timestamps are buffered.",
+        help="Direct-SHM metadata polling frequency. This is the camera polling rate, not dataset FPS; new source timestamps are buffered once.",
     )
-    parser.add_argument("--duration", type=float, default=None)
+    parser.add_argument(
+        "--duration", type=float, default=None,
+        help="Optional automatic recording duration in seconds. Leave unset for keyboard/FIFO-controlled recording.",
+    )
     parser.add_argument(
         "--camera",
         dest="camera_items",
         action="append",
         default=None,
-        help="RGB camera name or name=/topic. Repeat to select multiple cameras.",
+        help="RGB camera to record. Use a built-in name or name=/topic for ROS mode; repeat this option for multiple cameras.",
     )
     parser.add_argument(
         "--with-depth",
         action="store_true",
-        help="Record uint16 depth using LeRobot >= 0.6 native depth-video support.",
+        help="Enable the default uint16 depth camera and native depth-video encoding from LeRobot 0.6 or newer.",
     )
     parser.add_argument(
         "--depth-camera",
         dest="depth_camera_items",
         action="append",
         default=None,
-        help="Depth camera name or name=/topic. Implies --with-depth.",
+        help="Depth camera to record. Use a built-in name or name=/topic; specifying it automatically enables depth recording.",
     )
-    parser.add_argument("--with-head", action="store_true", help="Append 3 neck joints to state and joint actions.")
-    parser.add_argument("--with-waist", action="store_true", help="Append 4 leg/waist joints to state and joint actions.")
-    parser.add_argument("--camera-warmup-sec", type=float, default=3.0)
+    parser.add_argument(
+        "--with-head", action="store_true",
+        help="Append neck_roll, neck_pitch, and neck_yaw to state/action. Dataset state/action becomes 19-D without waist or 23-D with waist.",
+    )
+    parser.add_argument(
+        "--with-waist", action="store_true",
+        help="Append leg_ankle, leg_knee, waist_pitch, and waist_yaw to state/action. Dataset state/action becomes 20-D without head or 23-D with head.",
+    )
+    parser.add_argument(
+        "--camera-warmup-sec", type=float, default=3.0,
+        help="Maximum time to wait for all requested cameras to expose valid frames before initialization.",
+    )
     parser.add_argument(
         "--state-warmup-sec",
         type=float,
         default=10.0,
-        help="Maximum time to wait for the first complete state packet before cameras start.",
+        help="Maximum time to wait for the first complete state packet before camera polling begins.",
     )
     parser.add_argument(
         "--state-ready-file",
         default=None,
-        help="Atomic readiness file written after the first complete state packet.",
+        help="Optional path for an atomic readiness file written after the first complete state packet.",
     )
-    parser.add_argument("--min-cameras", type=int, default=1)
+    parser.add_argument(
+        "--min-cameras", type=int, default=1,
+        help="Minimum number of cameras that must be valid before recording starts; missing optional cameras invalidate ticks.",
+    )
     parser.add_argument(
         "--sync-reference-camera",
         default=None,
-        help="Camera whose new frames anchor synchronization. Defaults to hand_left when active, otherwise the first active camera.",
+        help="Camera whose new frames anchor each dataset tick. It must be active; defaults to hand_left, otherwise the first active camera.",
     )
     parser.add_argument(
         "--max-sync-delta-sec",
         type=float,
         default=0.03,
-        help="Maximum timestamp difference from the reference image (default: 30 ms).",
+        help="Maximum absolute timestamp difference from the reference image for other images, state, and action. A failed match invalidates the episode.",
     )
-    parser.add_argument("--max-image-age-sec", type=float, default=0.15)
-    parser.add_argument("--max-state-age-sec", type=float, default=0.15)
+    parser.add_argument(
+        "--max-image-age-sec", type=float, default=0.15,
+        help="Reject an image older than this many seconds at the recording tick.",
+    )
+    parser.add_argument(
+        "--max-state-age-sec", type=float, default=0.15,
+        help="Reject a joint-state sample older than this many seconds at the recording tick.",
+    )
     parser.add_argument(
         "--max-state-interpolation-gap-sec",
         type=float,
         default=0.05,
-        help="Maximum interval between state samples bracketing an image timestamp.",
+        help="Maximum time span between the two joint-state samples used for linear interpolation at an image timestamp.",
     )
     parser.add_argument(
         "--max-action-hold-sec",
         type=float,
         default=0.5,
-        help="Maximum age of a causal action target held at an image timestamp.",
+        help="Maximum age of the latest causal action target held until an image timestamp; older targets invalidate the tick.",
     )
     parser.add_argument(
         "--max-frame-interval-error-ratio",
         type=float,
         default=0.45,
-        help="Maximum reference-frame interval error as a fraction of 1/FPS.",
+        help="Maximum relative error of the reference-camera frame interval compared with the requested 1/FPS period.",
     )
-    parser.add_argument("--sync-image-buffer-size", type=int, default=DEFAULT_SYNC_IMAGE_BUFFER_SIZE)
-    parser.add_argument("--sync-signal-buffer-size", type=int, default=DEFAULT_SYNC_SIGNAL_BUFFER_SIZE)
-    parser.add_argument("--fallback-action-to-state", action="store_true")
-    parser.add_argument("--state-topic", default=STATE_TOPIC)
+    parser.add_argument(
+        "--sync-image-buffer-size", type=int, default=DEFAULT_SYNC_IMAGE_BUFFER_SIZE,
+        help="Maximum number of recent frames kept per camera in the image FIFO. Overflow invalidates the active episode.",
+    )
+    parser.add_argument(
+        "--sync-signal-buffer-size", type=int, default=DEFAULT_SYNC_SIGNAL_BUFFER_SIZE,
+        help="Maximum number of recent joint/action samples kept for timestamp matching.",
+    )
+    parser.add_argument(
+        "--fallback-action-to-state", action="store_true",
+        help="Use the measured state as action when no action topic is available; intended only for camera/link tests.",
+    )
+    parser.add_argument(
+        "--state-topic", default=STATE_TOPIC,
+        help="ROS2 JSON-string topic carrying the complete physical joint status packet.",
+    )
     parser.add_argument(
         "--action-mode",
         choices=("joint", "eef", "status_target"),
@@ -1576,42 +1634,43 @@ def parse_args() -> argparse.Namespace:
             "and 'eef' records a 15-d EEF target for debugging. EEF names intentionally differ from state."
         ),
     )
-    parser.add_argument("--action-arm-topic", default=ACTION_ARM_TOPIC)
-    parser.add_argument("--action-gripper-topic", default=ACTION_GRIPPER_TOPIC)
-    parser.add_argument("--action-eef-topic", default=ACTION_EEF_TOPIC)
-    parser.add_argument("--action-height-topic", default=ACTION_HEIGHT_TOPIC)
-    parser.add_argument("--image-writer-threads", type=int, default=4)
-    parser.add_argument("--vcodec", default="h264", help="Use h264 for speed; libsvtav1 for smaller files.")
+    parser.add_argument("--action-arm-topic", default=ACTION_ARM_TOPIC, help="ROS2 JSON topic for arm and whole-body joint target commands.")
+    parser.add_argument("--action-gripper-topic", default=ACTION_GRIPPER_TOPIC, help="ROS2 JSON topic for left/right gripper target commands.")
+    parser.add_argument("--action-eef-topic", default=ACTION_EEF_TOPIC, help="ROS2 JSON topic for end-effector pose targets when --action-mode=eef.")
+    parser.add_argument("--action-height-topic", default=ACTION_HEIGHT_TOPIC, help="ROS2 JSON topic for robot height targets when --action-mode=eef.")
+    parser.add_argument("--image-writer-threads", type=int, default=4, help="Number of background image-writer threads used by LeRobot.")
+    parser.add_argument("--vcodec", default="h264", help="RGB video codec passed to LeRobot; h264 favors speed, libsvtav1 favors smaller files.")
     parser.add_argument("--video-crf", type=float, default=None, help="Optional RGB video CRF/quality value.")
     parser.add_argument("--video-preset", default=None, help="Optional RGB video encoder preset.")
     parser.add_argument("--video-gop", type=int, default=None, help="Optional RGB video GOP/keyframe interval.")
-    parser.add_argument("--depth-vcodec", default="hevc", help="12-bit depth codec used by LeRobot 0.6.")
-    parser.add_argument("--depth-min", type=float, default=0.05, help="Minimum encoded depth in metres.")
-    parser.add_argument("--depth-max", type=float, default=10.0, help="Maximum encoded depth in metres.")
-    parser.add_argument("--depth-shift", type=float, default=3.5, help="LeRobot logarithmic depth quantizer shift.")
+    parser.add_argument("--depth-vcodec", default="hevc", help="Depth video codec used by LeRobot 0.6; hevc is the default 12-bit-capable choice.")
+    parser.add_argument("--depth-min", type=float, default=0.05, help="Minimum physical depth in metres passed to the depth quantizer.")
+    parser.add_argument("--depth-max", type=float, default=10.0, help="Maximum physical depth in metres passed to the depth quantizer.")
+    parser.add_argument("--depth-shift", type=float, default=3.5, help="Logarithmic depth quantizer shift used by LeRobot; affects depth precision distribution.")
     parser.add_argument(
         "--depth-use-log",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use logarithmic depth quantization (default: true).",
+        help="Enable logarithmic depth quantization; use --no-depth-use-log for linear depth quantization.",
     )
-    parser.add_argument("--batch-encoding-size", type=int, default=1)
-    parser.add_argument("--streaming-encoding", action="store_true", help="Encode videos during capture when supported by LeRobot.")
-    parser.add_argument("--encoder-queue-maxsize", type=int, default=30)
-    parser.add_argument("--encoder-threads", type=int, default=None)
-    parser.add_argument("--video-files-size-in-mb", type=int, default=None)
-    parser.add_argument("--data-files-size-in-mb", type=int, default=None)
-    parser.add_argument("--control-fifo", default=None, help="Optional FIFO path for start/save/discard/quit commands.")
+    parser.add_argument("--batch-encoding-size", type=int, default=1, help="Number of frames submitted together to the video encoder.")
+    parser.add_argument("--streaming-encoding", action="store_true", help="Encode videos while recording when supported; reduces finalization work but increases runtime load.")
+    parser.add_argument("--encoder-queue-maxsize", type=int, default=30, help="Maximum pending frame batches in the asynchronous encoder queue.")
+    parser.add_argument("--encoder-threads", type=int, default=None, help="Optional number of encoder worker threads; unset lets LeRobot choose.")
+    parser.add_argument("--video-files-size-in-mb", type=int, default=None, help="Optional maximum size of each video file before LeRobot starts a new segment.")
+    parser.add_argument("--data-files-size-in-mb", type=int, default=None, help="Optional maximum size of each Parquet data file before LeRobot starts a new segment.")
+    parser.add_argument("--control-fifo", default=None, help="Optional named pipe receiving start/save/discard/quit commands from the launcher.")
     parser.add_argument(
         "--status-file",
         default=None,
-        help="Optional JSON file used to acknowledge completed save/discard commands.",
+        help="Optional JSON status file atomically updated after save/discard completes.",
     )
     parser.add_argument(
         "--episode-event-file",
         default=None,
-        help="Optional JSON event file used to notify the launcher about invalid episodes.",
+        help="Optional JSON event file used to notify the launcher about saved, discarded, or invalid episodes.",
     )
+    show_requested_parameter_help(parser)
     args = parser.parse_args()
     if args.depth_min < 0 or args.depth_max <= args.depth_min:
         parser.error("depth range must satisfy 0 <= --depth-min < --depth-max")

@@ -18,6 +18,13 @@ python /home/ubuntu/deploy/deploy_pi05_004500.py \
 The default policy controls the two arms and grippers only. The head and waist
 remain at their latest measured positions in outgoing whole-body messages.
 
+Show all deployment parameters or one parameter:
+
+```bash
+python /home/ubuntu/deploy/deploy_pi05_004500.py --help
+python /home/ubuntu/deploy/deploy_pi05_004500.py --with-head --help
+```
+
 ## Optional head and waist control
 
 The policy must have been trained with the same dimensions as the selected

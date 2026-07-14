@@ -5,6 +5,224 @@ set -euo pipefail
 #   bash /home/ubuntu/lerobot_data_collector/start_lerobot_official_collect.sh [task_name] [task_text]
 #   TASK_TEXT="pick the mango" bash /home/ubuntu/lerobot_data_collector/start_lerobot_official_collect.sh pick_the_mango
 
+show_help() {
+    local parameter="${1:-}"
+    if [ -n "${parameter}" ]; then
+        case "${parameter}" in
+            TASK_NAME|task_name)
+                echo "TASK_NAME / task_name"
+                echo "Usage: bash start_lerobot_official_collect.sh <task_name> [task_text]"
+                echo "Directory name, repo-id suffix, and default task text for this collection session."
+                echo "Example: bash start_lerobot_official_collect.sh pick_up_bottle"
+                ;;
+            TASK_TEXT|task_text)
+                echo "TASK_TEXT / task_text"
+                echo "Usage: TASK_TEXT='pick up the bottle' bash start_lerobot_official_collect.sh pick_up_bottle"
+                echo "Natural-language instruction stored in every dataset frame."
+                ;;
+            OUTPUT_BASE_DIR)
+                echo "OUTPUT_BASE_DIR"
+                echo "Usage: OUTPUT_BASE_DIR=/mnt/nas bash start_lerobot_official_collect.sh task_name"
+                echo "Parent directory containing one task directory and dataset subdirectory per task. Default: /home/ubuntu/nas14"
+                ;;
+            COLLECT_FPS)
+                echo "COLLECT_FPS"
+                echo "Usage: COLLECT_FPS=30 bash start_lerobot_official_collect.sh task_name"
+                echo "Target dataset recording rate in frames per second. Default: 30"
+                ;;
+            WITH_HEAD)
+                echo "WITH_HEAD"
+                echo "Usage: WITH_HEAD=1 bash start_lerobot_official_collect.sh task_name"
+                echo "Append neck_roll, neck_pitch, and neck_yaw to state/action. Default: 0"
+                ;;
+            WITH_WAIST)
+                echo "WITH_WAIST"
+                echo "Usage: WITH_WAIST=1 bash start_lerobot_official_collect.sh task_name"
+                echo "Append leg_ankle, leg_knee, waist_pitch, and waist_yaw to state/action. Default: 0"
+                ;;
+            WITH_DEPTH)
+                echo "WITH_DEPTH"
+                echo "Usage: WITH_DEPTH=1 bash start_lerobot_official_collect.sh task_name"
+                echo "Record rgbd_head_depth in addition to the three default RGB cameras. Default: 0"
+                ;;
+            IMAGE_SOURCE)
+                echo "IMAGE_SOURCE"
+                echo "Usage: IMAGE_SOURCE=shm|ros bash start_lerobot_official_collect.sh task_name"
+                echo "Image transport: shm reads shared memory directly; ros starts the SHM-to-ROS bridge. Default: shm"
+                ;;
+            IMAGE_POLL_FPS)
+                echo "IMAGE_POLL_FPS"
+                echo "Usage: IMAGE_POLL_FPS=120 bash start_lerobot_official_collect.sh task_name"
+                echo "Direct-SHM metadata polling rate. It is not the dataset recording FPS. Default: 120"
+                ;;
+            SYNC_REFERENCE_CAMERA)
+                echo "SYNC_REFERENCE_CAMERA"
+                echo "Usage: SYNC_REFERENCE_CAMERA=hand_left bash start_lerobot_official_collect.sh task_name"
+                echo "Camera used as the timestamp anchor. It must be one of the active cameras. Default: hand_left when active"
+                ;;
+            MAX_SYNC_DELTA_SEC)
+                echo "MAX_SYNC_DELTA_SEC"
+                echo "Usage: MAX_SYNC_DELTA_SEC=0.04 bash start_lerobot_official_collect.sh task_name"
+                echo "Maximum allowed absolute timestamp difference from the reference frame. Unit: seconds. Default: 0.03 (30 ms)"
+                ;;
+            SYNC_IMAGE_BUFFER_SIZE)
+                echo "SYNC_IMAGE_BUFFER_SIZE"
+                echo "Usage: SYNC_IMAGE_BUFFER_SIZE=16 bash start_lerobot_official_collect.sh task_name"
+                echo "Per-camera image FIFO capacity. Overflow invalidates the active episode. Default: 16"
+                ;;
+            SYNC_SIGNAL_BUFFER_SIZE)
+                echo "SYNC_SIGNAL_BUFFER_SIZE"
+                echo "Usage: SYNC_SIGNAL_BUFFER_SIZE=64 bash start_lerobot_official_collect.sh task_name"
+                echo "Capacity of the state/action timestamp buffers. Default: 64"
+                ;;
+            MIN_CAMERAS)
+                echo "MIN_CAMERAS"
+                echo "Usage: MIN_CAMERAS=4 bash start_lerobot_official_collect.sh task_name"
+                echo "Minimum number of valid cameras required before recording. Default: 1"
+                ;;
+            MAX_IMAGE_AGE_SEC|MAX_STATE_AGE_SEC|MAX_STATE_INTERPOLATION_GAP_SEC|MAX_ACTION_HOLD_SEC)
+                cli_parameter="${parameter,,}"
+                cli_parameter="${cli_parameter//_/-}"
+                case "${parameter}" in
+                    MAX_IMAGE_AGE_SEC|MAX_STATE_AGE_SEC) default_value="0.15" ;;
+                    MAX_STATE_INTERPOLATION_GAP_SEC) default_value="0.05" ;;
+                    MAX_ACTION_HOLD_SEC) default_value="0.5" ;;
+                esac
+                echo "${parameter}"
+                echo "Usage: ${parameter}=${default_value} bash start_lerobot_official_collect.sh task_name"
+                echo "Freshness/interpolation limit in seconds; see record_lerobot_official.py --${cli_parameter} --help for the exact rule. Default: ${default_value}"
+                ;;
+            MAX_FRAME_INTERVAL_ERROR_RATIO)
+                echo "MAX_FRAME_INTERVAL_ERROR_RATIO"
+                echo "Usage: MAX_FRAME_INTERVAL_ERROR_RATIO=0.45 bash start_lerobot_official_collect.sh task_name"
+                echo "Maximum reference-camera interval error as a fraction of one requested frame period. Default: 0.45"
+                ;;
+            ACTION_MODE)
+                echo "ACTION_MODE"
+                echo "Usage: ACTION_MODE=status_target|joint|eef bash start_lerobot_official_collect.sh task_name"
+                echo "Action source: status_target is recommended; joint reads command topics; eef records end-effector targets. Default: status_target"
+                ;;
+            COLLECT_VCODEC|DEPTH_VCODEC|DEPTH_MIN|DEPTH_MAX|DEPTH_SHIFT|DEPTH_USE_LOG)
+                echo "${parameter}"
+                echo "Usage: ${parameter}=<value> bash start_lerobot_official_collect.sh task_name"
+                echo "Video/depth encoding option forwarded to the LeRobot recorder. See record_lerobot_official.py --help for units and defaults."
+                ;;
+            CAMERA_WARMUP_SEC|STATE_READY_TIMEOUT_SEC|CAMERA_DETECTION_TIMEOUT_SEC|CONTROL_ACK_TIMEOUT_SEC)
+                echo "${parameter}"
+                echo "Usage: ${parameter}=<seconds> bash start_lerobot_official_collect.sh task_name"
+                echo "Launcher wait/acknowledgement timeout in seconds. See the corresponding recorder/control --help output for the exact default."
+                ;;
+            BATCH_ENCODING_SIZE|ENCODER_QUEUE_MAXSIZE|ENCODER_THREADS|VIDEO_FILES_SIZE_IN_MB|DATA_FILES_SIZE_IN_MB|VIDEO_CRF|VIDEO_PRESET|VIDEO_GOP|STREAMING_ENCODING)
+                echo "${parameter}"
+                echo "Usage: ${parameter}=<value> bash start_lerobot_official_collect.sh task_name"
+                echo "Video encoding or file-segmentation option forwarded to the LeRobot recorder. Default: unset unless documented in record_lerobot_official.py --help."
+                ;;
+            ROBOT_PY|LEROBOT_PY)
+                echo "${parameter}"
+                echo "Usage: ${parameter}=/path/to/python bash start_lerobot_official_collect.sh task_name"
+                echo "Python interpreter used for the robot camera producer or LeRobot recorder. Use this only when environment locations differ from the defaults."
+                ;;
+            START_HAND_PRODUCER)
+                echo "START_HAND_PRODUCER"
+                echo "Usage: START_HAND_PRODUCER=0|1 bash start_lerobot_official_collect.sh task_name"
+                echo "Whether to start the hand-camera SHM producer. Set 0 when another process already owns the devices. Default: 1 unless devices are busy"
+                ;;
+            CAMERA_ONLY)
+                echo "CAMERA_ONLY"
+                echo "Usage: CAMERA_ONLY=1 bash start_lerobot_official_collect.sh task_name"
+                echo "Test only rgbd_head_color and use state as action fallback. This is for camera/link tests, not training data. Default: 0"
+                ;;
+            FALLBACK_ACTION_TO_STATE)
+                echo "FALLBACK_ACTION_TO_STATE"
+                echo "Usage: FALLBACK_ACTION_TO_STATE=1 bash start_lerobot_official_collect.sh task_name"
+                echo "Use measured state as action when action topics are unavailable. Default: 0"
+                ;;
+            ROS_DOMAIN_ID|ROBOT_ID|RMW_IMPLEMENTATION)
+                echo "${parameter}"
+                echo "Usage: ${parameter}=<value> bash start_lerobot_official_collect.sh task_name"
+                echo "ROS identity/middleware setting used to construct robot topic names. See the robot ROS configuration for valid values."
+                ;;
+            *)
+                echo "Unknown help parameter: ${parameter}" >&2
+                echo "Run: bash start_lerobot_official_collect.sh --help" >&2
+                return 2
+                ;;
+        esac
+        return 0
+    fi
+
+    cat <<'HELP'
+Official LeRobot collector launcher
+
+Usage:
+  bash start_lerobot_official_collect.sh [task_name] [task_text]
+  TASK_TEXT="pick up the bottle" bash start_lerobot_official_collect.sh pick_up_bottle
+
+Show one environment variable:
+  bash start_lerobot_official_collect.sh --help MAX_SYNC_DELTA_SEC
+  bash start_lerobot_official_collect.sh MAX_SYNC_DELTA_SEC --help
+
+Common parameters:
+  TASK_NAME                  Dataset/task directory name. Positional argument 1.
+  TASK_TEXT                  Natural-language task instruction. Positional argument 2 or environment variable.
+  OUTPUT_BASE_DIR            Dataset parent directory. Default: /home/ubuntu/nas14
+  COLLECT_FPS                Dataset FPS. Default: 30
+  WITH_HEAD                  Add 3 neck joints. Default: 0
+  WITH_WAIST                 Add 4 leg/waist joints. Default: 0
+  WITH_DEPTH                 Add rgbd_head_depth. Default: 0
+  IMAGE_SOURCE               shm or ros. Default: shm
+  IMAGE_POLL_FPS             SHM metadata polling rate. Default: 120
+  SYNC_REFERENCE_CAMERA      Timestamp anchor camera. Default: hand_left
+  MAX_SYNC_DELTA_SEC         Maximum sync error in seconds. Default: 0.03
+  SYNC_IMAGE_BUFFER_SIZE     Image FIFO capacity per camera. Default: 16
+  SYNC_SIGNAL_BUFFER_SIZE    State/action buffer capacity. Default: 64
+  MIN_CAMERAS                Minimum valid cameras. Default: 1
+  ACTION_MODE                status_target, joint, or eef. Default: status_target
+  MAX_IMAGE_AGE_SEC          Maximum image age in seconds. Default: 0.15
+  MAX_STATE_AGE_SEC          Maximum joint-state age in seconds. Default: 0.15
+  MAX_STATE_INTERPOLATION_GAP_SEC  Maximum interpolation span. Default: 0.05
+  MAX_ACTION_HOLD_SEC        Maximum held-action age. Default: 0.5
+  MAX_FRAME_INTERVAL_ERROR_RATIO  Reference interval error ratio. Default: 0.45
+  CAMERA_WARMUP_SEC          Camera initialization timeout. Default: 10 (launcher)
+  STATE_READY_TIMEOUT_SEC    First joint-state timeout. Default: 10
+  CAMERA_DETECTION_TIMEOUT_SEC  Camera detection timeout. Default: 15
+  CONTROL_ACK_TIMEOUT_SEC    Save/discard acknowledgement timeout. Default: 300
+  COLLECT_VCODEC             RGB video codec. Default: h264
+  DEPTH_VCODEC               Depth video codec. Default: hevc
+  DEPTH_MIN/MAX/SHIFT        Depth quantizer range and shift. Defaults: 0.05/10.0/3.5
+  DEPTH_USE_LOG              Logarithmic depth quantization. Default: 1
+  BATCH_ENCODING_SIZE        Frames per encoder batch. Default: 1
+  ENCODER_QUEUE_MAXSIZE      Maximum pending encoder batches. Default: 30
+  ENCODER_THREADS            Encoder worker threads. Default: unset
+  VIDEO_CRF/PRESET/GOP       Optional RGB encoding controls. Default: unset
+  VIDEO_FILES_SIZE_IN_MB     Optional video segment size. Default: unset
+  DATA_FILES_SIZE_IN_MB      Optional Parquet segment size. Default: unset
+  STREAMING_ENCODING         Encode videos during capture. Default: 0
+  START_HAND_PRODUCER        Start hand-camera producer. Default: 1 unless devices are busy
+  CAMERA_ONLY                Single-camera link test mode. Default: 0
+  FALLBACK_ACTION_TO_STATE   Use state as action for link tests. Default: 0
+  ROS_DOMAIN_ID              ROS domain. Default: 0
+  ROBOT_ID                   Robot topic suffix. Hostname suffix is used when unset.
+  RMW_IMPLEMENTATION         ROS middleware implementation. Default: rmw_cyclonedds_cpp
+
+Advanced timing, encoding, and timeout variables are forwarded to
+record_lerobot_official.py. Use its detailed CLI help:
+  python record_lerobot_official.py --help
+  python record_lerobot_official.py --max-sync-delta-sec --help
+
+Keyboard controls after startup: Enter=start, S=save, D=discard, Q=save and quit.
+HELP
+}
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    show_help "${2:-}"
+    exit 0
+fi
+if [ "${2:-}" = "--help" ] || [ "${2:-}" = "-h" ]; then
+    show_help "${1:-}"
+    exit 0
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TASK_NAME="${1:-mango_pick}"
 TASK_TEXT="${TASK_TEXT:-${2:-${TASK_NAME}}}"
