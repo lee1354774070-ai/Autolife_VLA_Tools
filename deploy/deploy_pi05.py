@@ -63,14 +63,17 @@ from camera_config import (  # noqa: E402
     CameraSpec,
 )
 from cli_help import show_requested_parameter_help  # noqa: E402
-from robot_schema import RobotSchema, build_robot_schema  # noqa: E402
-from shm_camera import read_shm_frame, read_shm_metadata, shm_timestamp_sec  # noqa: E402
+from session_control import SessionControl  # noqa: E402
+from robot_schema import (  # noqa: E402
+    RobotSchema,
+    build_robot_schema,
+    parse_whole_body_state,
+    schema_state_from_whole_body,
+    whole_body_from_schema_action,
+)
+from shm_camera import frame_to_hwc, read_shm_frame, read_shm_metadata, shm_timestamp_sec  # noqa: E402
 
 
-WHOLE_BODY_DIM = 23
-BASE_POLICY_DIM = 16
-HEAD_DIM = 3
-WAIST_DIM = 4
 DEFAULT_RGB_SHAPE = (3, 480, 640)
 DEFAULT_DEPTH_SHAPE = (1, 480, 640)
 DEFAULT_SYNC_REFERENCE_CAMERA = "hand_left"
@@ -101,75 +104,6 @@ def default_robot_id() -> str:
 
 def topic_id() -> str:
     return f"{os.getenv('ROS_DOMAIN_ID', '0')}_{default_robot_id()}"
-
-
-def flatten_joint_positions(packet: dict[str, Any]) -> np.ndarray | None:
-    """Read the fixed physical q23 order from a robot status JSON packet.
-
-    Missing or short groups are rejected rather than silently padded. Padding
-    a live robot state could make a policy issue a large, unexpected command.
-    """
-
-    groups = (
-        ("leg_waist_joint_state", 4),
-        ("left_arm_joint_state", 7),
-        ("right_arm_joint_state", 7),
-        ("left_gripper_state", 1),
-        ("right_gripper_state", 1),
-        ("neck_joint_state", 3),
-    )
-    values: list[float] = []
-    for key, size in groups:
-        group = packet.get(key)
-        positions = group.get("position") if isinstance(group, dict) else None
-        if not isinstance(positions, (list, tuple)) or len(positions) < size:
-            return None
-        try:
-            values.extend(float(value) for value in positions[:size])
-        except (TypeError, ValueError):
-            return None
-    return np.asarray(values, dtype=np.float32)
-
-
-def policy_state_from_q23(q23: np.ndarray, schema: RobotSchema) -> np.ndarray:
-    """Convert physical q23 into the collector's canonical state order."""
-
-    q = np.asarray(q23, dtype=np.float32).reshape(-1)
-    if q.size < WHOLE_BODY_DIM:
-        raise ValueError(f"Expected {WHOLE_BODY_DIM} physical joints, got {q.size}.")
-
-    values = [*q[4:11], *q[11:18], q[18], q[19]]
-    if any(group.name == "head" for group in schema.groups):
-        values.extend(q[20:23])
-    if any(group.name == "waist" for group in schema.groups):
-        values.extend(q[:4])
-    state = np.asarray(values, dtype=np.float32)
-    if state.size != schema.size:
-        raise AssertionError(f"Internal schema conversion produced {state.size}, expected {schema.size}.")
-    return state
-
-
-def physical_q23_from_action(action: np.ndarray, latest_q23: np.ndarray, schema: RobotSchema) -> np.ndarray:
-    """Map canonical policy action back to the physical ROS q23 order."""
-
-    action = np.asarray(action, dtype=np.float32).reshape(-1)
-    if action.size < schema.size:
-        raise ValueError(f"Policy returned {action.size} dims, expected {schema.size}.")
-    q = np.asarray(latest_q23, dtype=np.float32).reshape(-1)[:WHOLE_BODY_DIM].copy()
-
-    # Base dimensions are always controlled by this policy.
-    q[4:11] = action[0:7]
-    q[11:18] = action[7:14]
-    q[18] = action[14]
-    q[19] = action[15]
-
-    offset = BASE_POLICY_DIM
-    if any(group.name == "head" for group in schema.groups):
-        q[20:23] = action[offset : offset + HEAD_DIM]
-        offset += HEAD_DIM
-    if any(group.name == "waist" for group in schema.groups):
-        q[:4] = action[offset : offset + WAIST_DIM]
-    return q
 
 
 def image_to_policy_chw(image: np.ndarray, target_shape: tuple[int, int, int]) -> np.ndarray:
@@ -238,10 +172,11 @@ def depth_to_policy_chw(
     return result
 
 
-def load_policy(model_dir: Path, device: str):
-    """Load a LeRobot PI0.5 policy and its saved feature contract."""
+def load_policy(model_dir: Path, device: str, tokenizer_dir: Path | None = None):
+    """Load a PI0.5 policy together with its saved I/O processors."""
 
     try:
+        from lerobot.policies import make_pre_post_processors
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
     except ImportError as exc:
         raise SystemExit(
@@ -250,9 +185,21 @@ def load_policy(model_dir: Path, device: str):
 
     policy = PI05Policy.from_pretrained(str(model_dir))
     policy = policy.to(device).eval()
+    preprocessor_overrides: dict[str, dict[str, str]] = {}
+    if tokenizer_dir is not None:
+        if not tokenizer_dir.is_dir():
+            raise FileNotFoundError(f"Tokenizer directory does not exist: {tokenizer_dir}")
+        preprocessor_overrides = {
+            "tokenizer_processor": {"tokenizer_name": str(tokenizer_dir)},
+        }
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy.config,
+        pretrained_path=str(model_dir),
+        preprocessor_overrides=preprocessor_overrides,
+    )
     if hasattr(policy, "reset"):
         policy.reset()
-    return policy
+    return policy, preprocessor, postprocessor
 
 
 def read_model_contract(
@@ -315,7 +262,7 @@ class JointTelemetryNode(Node):
             return
         if not isinstance(packet, dict):
             return
-        q23 = flatten_joint_positions(packet)
+        q23 = parse_whole_body_state(packet)
         if q23 is None:
             return
         with self._lock:
@@ -378,11 +325,19 @@ class AutoLifeCommandNode(Node):
 class ShmImage:
     """One decoded source image plus the timestamp used for multi-camera sync."""
 
-    name: str
     image_hwc: np.ndarray
     stamp_sec: float
     received_sec: float
     is_depth: bool
+
+
+@dataclass(frozen=True)
+class InferredAction:
+    """One policy result kept separate from the side-effect of publishing it."""
+
+    action: np.ndarray
+    command_q23: np.ndarray
+    elapsed_ms: float
 
 
 class DirectShmCamera:
@@ -399,25 +354,10 @@ class DirectShmCamera:
         frame = read_shm_frame(self.spec, metadata)
         if frame is None or frame.timestamp_ns != metadata[0]:
             return None
-        if self.is_depth:
-            if frame.pixel_format != 2 or frame.channels != 1:
-                raise ValueError(
-                    f"{self.spec.name} must be pixel_format=2/channels=1, "
-                    f"got {frame.pixel_format}/{frame.channels}"
-                )
-            image = np.frombuffer(frame.data, dtype="<u2").reshape(frame.height, frame.width, 1).copy()
-        else:
-            if frame.pixel_format != 1 or frame.channels != 3:
-                raise ValueError(
-                    f"{self.spec.name} must be pixel_format=1/channels=3, "
-                    f"got {frame.pixel_format}/{frame.channels}"
-                )
-            image = np.frombuffer(frame.data, dtype=np.uint8).reshape(frame.height, frame.width, 3).copy()
         self.last_timestamp_ns = frame.timestamp_ns
         received_sec = time.time()
         return ShmImage(
-            name=self.spec.name,
-            image_hwc=np.ascontiguousarray(image),
+            image_hwc=frame_to_hwc(frame, self.is_depth),
             stamp_sec=shm_timestamp_sec(frame.timestamp_ns, received_sec),
             received_sec=received_sec,
             is_depth=self.is_depth,
@@ -472,12 +412,13 @@ class DirectShmCameraSet:
             selected[name] = image
         return selected
 
-    def close(self) -> None:
-        """Keep a symmetric lifecycle API for future SHM resource handles."""
-
-
 class LocalPI05Deployer:
-    """Coordinate state/image snapshots, policy inference, and robot commands."""
+    """Coordinate state/image snapshots, policy inference, and robot commands.
+
+    ROS2 and SHM readers are initialized when this object is created. The PI0.5
+    model itself is deliberately loaded only by :meth:`enable`, allowing the
+    interactive console to keep a warmed policy in GPU memory between tasks.
+    """
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -490,6 +431,11 @@ class LocalPI05Deployer:
         self.command_node: AutoLifeCommandNode | None = None
         self.executor: MultiThreadedExecutor | None = None
         self.spin_thread: threading.Thread | None = None
+        self._policy_lock = threading.RLock()
+        self.policy: Any | None = None
+        self.policy_preprocessor: Any | None = None
+        self.policy_postprocessor: Any | None = None
+        self.model_enabled = False
 
         contract_state, contract_action, contract_images, contract_action_names = read_model_contract(args.model_dir)
         expected_dim = self.schema.size
@@ -546,12 +492,91 @@ class LocalPI05Deployer:
         self.camera_set = DirectShmCameraSet(tuple(args.camera_names), set(args.depth_camera_names))
         self.latest_images: dict[str, np.ndarray] = {}
         self.latest_image_received_sec = 0.0
-        self.policy = load_policy(args.model_dir, args.device)
+        self.contract_action_dim = contract_action
 
+    def _print_model_summary(self) -> None:
         print(f"policy schema: {', '.join(self.schema.names)}")
-        print(f"policy state/action dimensions: {expected_dim}/{contract_action or 'unknown'}")
-        print(f"camera inputs: {', '.join(args.camera_names)}")
-        print(f"camera source: direct SHM, reference={args.sync_reference_camera}")
+        print(f"policy state/action dimensions: {self.schema.size}/{self.contract_action_dim or 'unknown'}")
+        print(f"camera inputs: {', '.join(self.args.camera_names)}")
+        print(f"camera source: direct SHM, reference={self.args.sync_reference_camera}")
+
+    def enable(self) -> None:
+        """Load and compile the model once without publishing a robot command."""
+
+        with self._policy_lock:
+            if self.policy is None:
+                print("Loading PI0.5 policy into memory...")
+                (
+                    self.policy,
+                    self.policy_preprocessor,
+                    self.policy_postprocessor,
+                ) = load_policy(
+                    self.args.model_dir,
+                    self.args.device,
+                    self.args.tokenizer_dir,
+                )
+                self._print_model_summary()
+
+            if self.model_enabled:
+                print("Model is already enabled.")
+                return
+
+        self.wait_until_ready()
+        q23, _ = self.refresh()
+        if q23 is None:
+            raise RuntimeError("Joint state disappeared while preparing the model.")
+
+        # Run one complete forward pass to populate CUDA and Torch compile
+        # caches. It intentionally never reaches publish_action(). Resetting
+        # afterwards discards the warm-up action chunk before a real task.
+        print("Warming up PI0.5 policy without publishing commands...")
+        self.select_action(q23, self.args.task)
+        with self._policy_lock:
+            assert self.policy is not None
+            if hasattr(self.policy, "reset"):
+                self.policy.reset()
+            self.model_enabled = True
+        print("Model enabled and ready. Use: start <task text>")
+
+    def start_task(self, task: str) -> None:
+        """Clear a previous action chunk before a new natural-language task."""
+
+        task = task.strip()
+        if not task:
+            raise ValueError("start requires task text, for example: start pick up the water bottle")
+        with self._policy_lock:
+            if not self.model_enabled or self.policy is None:
+                raise RuntimeError("Model is not enabled. Run enable first.")
+            if hasattr(self.policy, "reset"):
+                self.policy.reset()
+
+    def infer_step(self, task: str) -> InferredAction | None:
+        """Infer one fresh action without publishing it to the robot."""
+
+        loop_started = time.monotonic()
+        q23, state_received_sec = self.refresh()
+        now = time.time()
+        if q23 is None or len(self.latest_images) != len(self.args.camera_names):
+            return None
+        if now - state_received_sec > self.args.max_state_age_sec:
+            return None
+        if now - self.latest_image_received_sec > self.args.max_image_age_sec:
+            return None
+
+        with self._policy_lock:
+            if not self.model_enabled or self.policy is None:
+                return None
+            action = self.select_action(q23, task)
+            command_q23 = whole_body_from_schema_action(action, q23, self.schema)
+        return InferredAction(action, command_q23, (time.monotonic() - loop_started) * 1000.0)
+
+    def publish_command(self, command_q23: np.ndarray) -> None:
+        """Publish a command already approved by the session state machine."""
+
+        if self.args.dry_run:
+            return
+        assert self.command_node is not None
+        self.command_node.publish_action(command_q23, self.args.gripper_int)
 
     def close(self) -> None:
         self.stop_requested = True
@@ -566,11 +591,17 @@ class LocalPI05Deployer:
                     node.destroy_node()
                 except Exception:
                     pass
-        self.camera_set.close()
         try:
             rclpy.shutdown()
         except Exception:
             pass
+        with self._policy_lock:
+            self.model_enabled = False
+            self.policy_postprocessor = None
+            self.policy_preprocessor = None
+            self.policy = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def refresh(self) -> tuple[np.ndarray | None, float]:
         assert self.telemetry is not None
@@ -596,7 +627,10 @@ class LocalPI05Deployer:
                     )
                 else:
                     self.latest_images[name] = image_to_policy_chw(image.image_hwc, shape)
-            self.latest_image_received_sec = max(image.received_sec for image in synchronized.values())
+            # Track the oldest camera in the synchronized observation. Using
+            # the newest receive time could let one stale camera survive the
+            # outer freshness check longer than intended.
+            self.latest_image_received_sec = min(image.received_sec for image in synchronized.values())
         return q23, state_received_sec
 
     def wait_until_ready(self) -> None:
@@ -617,14 +651,14 @@ class LocalPI05Deployer:
             missing.append("cameras " + ", ".join(missing_cameras))
         raise TimeoutError(f"Timed out waiting for: {', '.join(missing)}")
 
-    def build_observation(self, q23: np.ndarray) -> dict[str, Any]:
+    def build_observation(self, q23: np.ndarray, task: str) -> dict[str, Any]:
         missing = [name for name in self.args.camera_names if name not in self.latest_images]
         if missing:
             raise RuntimeError("Camera observations are not ready: " + ", ".join(missing))
-        state = policy_state_from_q23(q23, self.schema)
+        state = schema_state_from_whole_body(q23, self.schema)
         observation: dict[str, Any] = {
             "observation.state": torch.from_numpy(state),
-            "task": self.args.task,
+            "task": task,
         }
         for name in self.args.camera_names:
             image = self.latest_images[name]
@@ -633,11 +667,18 @@ class LocalPI05Deployer:
             observation[f"observation.images.{name}"] = torch.from_numpy(image)
         return observation
 
-    def select_action(self, q23: np.ndarray) -> np.ndarray:
+    def select_action(self, q23: np.ndarray, task: str) -> np.ndarray:
         assert self.policy is not None
-        observation = self.build_observation(q23)
+        assert self.policy_preprocessor is not None
+        assert self.policy_postprocessor is not None
+        observation = self.build_observation(q23, task)
         with torch.inference_mode():
-            action = self.policy.select_action(observation)
+            # PI0.5 requires the saved processor pipeline: it normalizes state,
+            # tokenizes ``task`` into observation.language.* fields, and moves
+            # tensors to the policy device. The postprocessor restores physical
+            # action values using the checkpoint's training statistics.
+            action = self.policy.select_action(self.policy_preprocessor(observation))
+            action = self.policy_postprocessor(action)
         if isinstance(action, dict):
             action = action.get("action")
         if isinstance(action, torch.Tensor):
@@ -658,7 +699,8 @@ class LocalPI05Deployer:
         return array[:expected_dim]
 
     def run(self) -> None:
-        self.wait_until_ready()
+        self.enable()
+        self.start_task(self.args.task)
         period_sec = 1.0 / max(self.args.hz, 1e-6)
         print(
             f"Inference started: task={self.args.task!r}, hz={self.args.hz}, "
@@ -672,32 +714,185 @@ class LocalPI05Deployer:
         next_deadline = time.monotonic()
         step = 0
         while not self.stop_requested and (self.args.max_steps <= 0 or step < self.args.max_steps):
-            loop_started = time.monotonic()
-            q23, state_received_sec = self.refresh()
-            now = time.time()
-            if q23 is None or len(self.latest_images) != len(self.args.camera_names):
+            result = self.infer_step(self.args.task)
+            if result is None:
                 time.sleep(0.002)
                 continue
-            if now - state_received_sec > self.args.max_state_age_sec:
-                time.sleep(0.002)
-                continue
-            if now - self.latest_image_received_sec > self.args.max_image_age_sec:
-                time.sleep(0.002)
-                continue
-
-            action = self.select_action(q23)
-            command_q23 = physical_q23_from_action(action, q23, self.schema)
-            if not self.args.dry_run:
-                assert self.command_node is not None
-                self.command_node.publish_action(command_q23, self.args.gripper_int)
+            if self.stop_requested:
+                break
+            self.publish_command(result.command_q23)
+            action, elapsed_ms = result.action, result.elapsed_ms
 
             if step % max(1, self.args.print_every) == 0:
-                elapsed_ms = (time.monotonic() - loop_started) * 1000.0
                 print(
                     f"step={step} loop_ms={elapsed_ms:.1f} "
                     f"left_gripper={action[14]:.3f} right_gripper={action[15]:.3f}"
                 )
             step += 1
+            next_deadline += period_sec
+            remaining = next_deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            else:
+                next_deadline = time.monotonic()
+
+
+class InteractiveDeploymentSession:
+    """Keep one enabled PI0.5 policy alive while accepting terminal commands.
+
+    The command reader runs separately from inference. ``SessionControl``
+    invalidates any action that was inferred before a start, stop, continue, or
+    exit transition, then authorizes publication immediately before ROS output.
+    """
+
+    def __init__(self, deployer: LocalPI05Deployer) -> None:
+        self.deployer = deployer
+        self.control = SessionControl()
+        self._exit_requested = threading.Event()
+        self._command_thread: threading.Thread | None = None
+
+    def request_exit(self) -> None:
+        self._exit_requested.set()
+        self.control.request_exit()
+        self.deployer.stop_requested = True
+
+    def _enable(self) -> None:
+        if self.deployer.model_enabled:
+            print("Model is already enabled.")
+            return
+        try:
+            self.deployer.enable()
+        except Exception as exc:
+            print(f"enable failed: {exc}")
+            return
+        self.control.mark_enabled()
+
+    def _start(self, task: str) -> None:
+        task = task.strip()
+        if not task:
+            print("start failed: start requires task text, for example: start pick up the water bottle")
+            return
+        generation = self.control.begin_start()
+        try:
+            self.deployer.start_task(task)
+        except (RuntimeError, ValueError) as exc:
+            self.control.abort_transition(generation)
+            print(f"start failed: {exc}")
+            return
+        if self.control.finish_start(generation, task):
+            print(f"Started task: {task!r}")
+
+    def _stop(self) -> None:
+        if self.control.pause():
+            print("Inference paused. The model remains loaded; use continue to resume.")
+        else:
+            print("Inference is not running.")
+
+    def _continue(self) -> None:
+        pending = self.control.begin_continue(self.deployer.args.max_steps)
+        if pending is None:
+            print("No task is available to continue. Use start <task text>.")
+            return
+        task, generation = pending
+        try:
+            # Keep the task and loaded weights, but discard actions inferred
+            # before the pause. The next step uses the current robot state.
+            self.deployer.start_task(task)
+        except (RuntimeError, ValueError) as exc:
+            self.control.abort_transition(generation)
+            print(f"continue failed: {exc}")
+            return
+        if not self.control.finish_continue(generation):
+            return
+        print(f"Continuing task: {task!r}")
+
+    def _status(self) -> None:
+        snapshot = self.control.snapshot()
+        print(
+            f"status: mode={snapshot.mode}, model_enabled={self.deployer.model_enabled}, "
+            f"steps={snapshot.step}, task={snapshot.task!r}"
+        )
+
+    def handle_command(self, line: str) -> None:
+        command, _, remainder = line.strip().partition(" ")
+        command = command.lower()
+        if not command:
+            return
+        if command == "enable":
+            self._enable()
+        elif command == "start":
+            self._start(remainder)
+        elif command == "stop":
+            self._stop()
+        elif command == "continue":
+            self._continue()
+        elif command == "status":
+            self._status()
+        elif command in {"help", "?"}:
+            self.print_help()
+        elif command == "exit":
+            print("Exiting deployment session.")
+            self.request_exit()
+        else:
+            print(f"Unknown command: {command!r}. Type help for available commands.")
+
+    @staticmethod
+    def print_help() -> None:
+        print(
+            "Commands:\n"
+            "  enable              Load and warm up the model without publishing commands.\n"
+            "  start <task text>   Reset PI0.5 and begin a new task.\n"
+            "  stop                Pause publishing and retain the model in memory.\n"
+            "  continue            Resume the paused task from a fresh observation.\n"
+            "  status              Show the session state.\n"
+            "  exit                Stop publishing, release resources, and exit."
+        )
+
+    def _read_commands(self) -> None:
+        while not self._exit_requested.is_set():
+            line = sys.stdin.readline()
+            if not line:
+                print("Command input closed; exiting deployment session.")
+                self.request_exit()
+                return
+            self.handle_command(line)
+
+    def run(self) -> None:
+        self.print_help()
+        self._command_thread = threading.Thread(target=self._read_commands, daemon=True)
+        self._command_thread.start()
+        period_sec = 1.0 / max(self.deployer.args.hz, 1e-6)
+        next_deadline = time.monotonic()
+
+        while not self._exit_requested.is_set() and not self.deployer.stop_requested:
+            snapshot = self.control.snapshot()
+            if snapshot.mode != "running":
+                time.sleep(0.05)
+                next_deadline = time.monotonic()
+                continue
+
+            result = self.deployer.infer_step(snapshot.task)
+            if result is None:
+                time.sleep(0.002)
+                continue
+            published = self.control.publish_if_current(
+                snapshot.generation,
+                lambda: self.deployer.publish_command(result.command_q23),
+            )
+            if not published:
+                continue
+            if snapshot.step % max(1, self.deployer.args.print_every) == 0:
+                print(
+                    f"step={snapshot.step} loop_ms={result.elapsed_ms:.1f} "
+                    f"left_gripper={result.action[14]:.3f} right_gripper={result.action[15]:.3f}"
+                )
+            reached_limit = self.control.record_published_step(
+                snapshot.generation,
+                self.deployer.args.max_steps,
+            )
+            if reached_limit:
+                print("Maximum step count reached; inference paused.")
+
             next_deadline += period_sec
             remaining = next_deadline - time.monotonic()
             if remaining > 0:
@@ -719,7 +914,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--model-dir", type=Path, default=repo_default, help="Local LeRobot pretrained_model directory to load.")
+    parser.add_argument(
+        "--tokenizer-dir",
+        type=Path,
+        default=Path(os.getenv("PI05_TOKENIZER_DIR")) if os.getenv("PI05_TOKENIZER_DIR") else None,
+        help=(
+            "Optional local PaliGemma tokenizer directory. Use this when the checkpoint's tokenizer "
+            "is not cached or the robot cannot access Hugging Face."
+        ),
+    )
     parser.add_argument("--task", default="mango_pick", help="Natural-language task prompt passed to the PI0.5 tokenizer.")
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Keep the process alive and accept enable/start/stop/continue/exit commands from the terminal.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used for policy inference, such as cuda or cpu.")
     parser.add_argument("--hz", type=float, default=10.0, help="Robot command publication and inference loop frequency in Hz.")
     parser.add_argument("--max-steps", type=int, default=0, help="Maximum inference steps; 0 runs until Ctrl-C.")
@@ -787,6 +996,8 @@ def parse_args() -> argparse.Namespace:
     show_requested_parameter_help(parser)
     args = parser.parse_args()
     args.model_dir = args.model_dir.expanduser().resolve()
+    if args.tokenizer_dir is not None:
+        args.tokenizer_dir = args.tokenizer_dir.expanduser().resolve()
     args.camera_names = list(dict.fromkeys(args.camera_names or DEFAULT_RGB_CAMERA_NAMES))
     args.depth_camera_names = list(dict.fromkeys(args.depth_camera_names or []))
     if args.with_depth and not args.depth_camera_names:
@@ -806,30 +1017,44 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit(f"Model directory does not exist: {args.model_dir}")
     if (
         args.hz <= 0
+        or args.max_steps < 0
+        or args.warmup_sec <= 0
+        or args.start_delay_sec < 0
+        or args.print_every <= 0
         or args.max_state_age_sec <= 0
         or args.max_image_age_sec <= 0
         or args.max_image_delta_sec <= 0
         or args.depth_min < 0
         or args.depth_max <= args.depth_min
     ):
-        raise SystemExit("hz, freshness limits, image delta, and depth range must be positive and valid.")
+        raise SystemExit(
+            "hz, warmup, print interval, freshness limits, image delta, and depth range must be "
+            "positive; max steps and start delay cannot be negative."
+        )
     return args
 
 
 def main() -> None:
     args = parse_args()
     deployer: LocalPI05Deployer | None = None
+    session: InteractiveDeploymentSession | None = None
 
     def request_stop(signum: int, frame: Any) -> None:
         del signum, frame
-        if deployer is not None:
+        if session is not None:
+            session.request_exit()
+        elif deployer is not None:
             deployer.stop_requested = True
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     try:
         deployer = LocalPI05Deployer(args)
-        deployer.run()
+        if args.interactive:
+            session = InteractiveDeploymentSession(deployer)
+            session.run()
+        else:
+            deployer.run()
     except KeyboardInterrupt:
         pass
     finally:

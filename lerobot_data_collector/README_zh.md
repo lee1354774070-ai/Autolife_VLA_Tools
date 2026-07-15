@@ -1,179 +1,89 @@
-# LeRobot 数据采集工具使用说明
+# LeRobot 数据采集工具
 
-本工具在机器人上采集数据，并保存为官方 `LeRobotDataset`。正常采集只需要
-使用一个终端运行启动脚本并通过键盘控制。
+本工具将 Autolife 机器人的同步 state、action、RGB 和可选 depth 写入官方
+`LeRobotDataset`。正常采集只需要一个终端。
 
-## 1. 启动
+## 启动
 
 ```bash
 cd /home/ubuntu/lerobot_data_collector
-bash ./start_lerobot_official_collect.sh <task_name> "<task text>"
-```
-
-示例：
-
-```bash
 TASK_TEXT="pick up the water bottle" \
-bash ./start_lerobot_official_collect.sh pick_up_water_bottle
+bash start_lerobot_official_collect.sh pick_up_water_bottle
 ```
 
-默认数据保存到：
-
-```text
-/home/ubuntu/nas14/<task_name>/dataset/
-```
-
-## 1.1 查看参数帮助
-
-查看启动脚本的全部环境变量说明：
-
-```bash
-bash ./start_lerobot_official_collect.sh --help
-```
-
-只查看某一个环境变量：
-
-```bash
-bash ./start_lerobot_official_collect.sh --help MAX_SYNC_DELTA_SEC
-bash ./start_lerobot_official_collect.sh MAX_SYNC_DELTA_SEC --help
-```
-
-查看底层录制器的全部命令行参数：
-
-```bash
-python ./record_lerobot_official.py --help
-```
-
-只查看一个录制器参数：
-
-```bash
-python ./record_lerobot_official.py --max-sync-delta-sec --help
-python ./record_lerobot_official.py --with-depth --help
-```
-
-单参数帮助不要求提供其他必填参数，也不会启动录制。
-
-修改保存位置：
+默认输出目录为 `/home/ubuntu/nas14/<task_name>/dataset`。使用
+`OUTPUT_BASE_DIR` 可以修改保存位置：
 
 ```bash
 OUTPUT_BASE_DIR=/mnt/data \
 TASK_TEXT="put the water bottle in the box" \
-bash ./start_lerobot_official_collect.sh put_water_bottle_in_box
+bash start_lerobot_official_collect.sh put_water_bottle_in_box
 ```
 
-## 2. 录制控制
+## 录制控制
 
-启动完成并显示 `Interactive controls` 后，在当前终端使用：
-
-| 按键 | 功能 |
+| 按键 | 作用 |
 | --- | --- |
-| `Enter` | 开始录制一条新的 episode |
-| `S` / `s` | 保存当前 episode，并暂停 |
-| `D` / `d` | 丢弃当前 episode，并暂停 |
-| `Q` / `q` | 保存有效 episode 并退出 |
-| `Ctrl+C` | 停止采集并执行清理 |
+| `Enter` | 开始一条新的 episode。 |
+| `S` | 保存当前有效 episode 并暂停。 |
+| `D` | 丢弃当前 episode 并暂停。 |
+| `Q` | 保存有效的 pending episode，finalize 后退出。 |
+| `Ctrl+C` | 停止相关进程，已保存数据保留。 |
 
-如果某条 episode 发生同步失败，终端会提示 `EPISODE INVALID`。此时必须
-按 `D` 丢弃，不能保存该 episode。
+终端出现 `EPISODE INVALID` 时必须按 `D`。无效 episode 不应保存。
 
-## 3. 常用采集配置
-
-### 30 FPS、头部、腰部和 depth
+## 常用采集方式
 
 ```bash
-COLLECT_FPS=30 \
-WITH_HEAD=1 \
-WITH_WAIST=1 \
-WITH_DEPTH=1 \
-bash ./start_lerobot_official_collect.sh hotel_service
+# 16 维基础关节和三路 RGB。
+bash start_lerobot_official_collect.sh rgb_task
+
+# 30 FPS、23 维关节、三路 RGB 和头部 depth。
+COLLECT_FPS=30 WITH_HEAD=1 WITH_WAIST=1 WITH_DEPTH=1 \
+bash start_lerobot_official_collect.sh hotel_service
+
+# 仅诊断相机链路：头部彩色相机，state 回退为 action。
+CAMERA_ONLY=1 bash start_lerobot_official_collect.sh camera_test
 ```
 
-此时：
+## 主要配置
 
-- `observation.state` 为 23 维；
-- 默认 action 为 23 维；
-- 录制头部 RGB、左手、右手和 depth 四路相机；
-- 默认使用 `hand_left` 作为同步参考相机。
-
-### 只采集基础关节和 RGB
-
-```bash
-bash ./start_lerobot_official_collect.sh rgb_test
-```
-
-### 只测试头部彩色相机
-
-```bash
-CAMERA_ONLY=1 \
-bash ./start_lerobot_official_collect.sh camera_test
-```
-
-该模式使用 state 作为 action 回退，只适合测试相机链路。
-
-## 4. 常用环境变量
-
-| 变量 | 默认值 | 作用 |
+| 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `OUTPUT_BASE_DIR` | `/home/ubuntu/nas14` | 数据保存父目录 |
-| `TASK_TEXT` | task name | 写入数据集的任务文本 |
-| `COLLECT_FPS` | `30` | 数据集录制帧率 |
-| `WITH_HEAD` | `0` | 增加 3 个头部关节 |
-| `WITH_WAIST` | `0` | 增加 4 个腰部/腿部关节 |
-| `WITH_DEPTH` | `0` | 增加 depth 视频 |
-| `ACTION_MODE` | `status_target` | `status_target`、`joint` 或 `eef` |
-| `IMAGE_SOURCE` | `shm` | `shm` 直读或 `ros` topic 输入 |
-| `IMAGE_POLL_FPS` | `120` | SHM 检查频率，不是录制帧率 |
-| `SYNC_IMAGE_BUFFER_SIZE` | `16` | 每路图像 FIFO 容量 |
-| `SYNC_REFERENCE_CAMERA` | `hand_left` | 同步参考相机 |
-| `MAX_SYNC_DELTA_SEC` | `0.03` | 相机最大同步时间差 |
-| `MIN_CAMERAS` | `1` | 最少有效相机数量 |
+| `TASK_TEXT` | task name | 写入每帧的自然语言任务。 |
+| `COLLECT_FPS` | `30` | 数据集帧率。 |
+| `WITH_HEAD` / `WITH_WAIST` | `0` | 追加 3 个头部 / 4 个腰部关节。 |
+| `WITH_DEPTH` | `0` | 增加 `rgbd_head_depth` 的 uint16 depth 视频。 |
+| `ACTION_MODE` | `status_target` | `status_target`、`joint` 或 `eef`。 |
+| `IMAGE_SOURCE` | `shm` | 直读共享内存或 `ros` topic。 |
+| `SYNC_REFERENCE_CAMERA` | `hand_left` | 图像时间戳锚点。 |
+| `MAX_SYNC_DELTA_SEC` | `0.03` | 相机允许的最大时间差。 |
+| `SYNC_IMAGE_BUFFER_SIZE` | `16` | 每路图像 FIFO 容量。 |
+| `MIN_CAMERAS` | 全部已选相机 | 任一请求相机不可用时拒绝启动。 |
 
-例如，使用 ROS 图像 topic：
+所有参数都可通过内置帮助查看：
 
 ```bash
-IMAGE_SOURCE=ros bash ./start_lerobot_official_collect.sh ros_test
+bash start_lerobot_official_collect.sh --help
+bash start_lerobot_official_collect.sh MAX_SYNC_DELTA_SEC --help
+python record_lerobot_official.py --with-depth --help
 ```
 
-## 5. 任务和数据集
+## 续采和输出
 
-`task_name` 同时用于：
-
-- 数据集目录名称；
-- 默认 repo id；
-- 没有设置 `TASK_TEXT` 时的任务文本。
-
-退出后再次使用相同的 `task_name`，工具会尝试继续写入原来的 dataset。以下
-配置必须保持一致：相机集合、FPS、depth、头部/腰部关节和 action mode。
-
-如果需要改变这些配置，请使用新的 `task_name` 或新的输出目录。
-
-每次启动后，终端会打印实际录制的相机列表。正式采集前请确认列表正确。
-
-## 6. 输出文件
+相同 `task_name` 会尝试续采已有数据集，但相机 feature、FPS、关节 schema、depth
+开关和 action mode 必须完全一致。改变其中任何一项时，请使用新的 task name 或输出目录。
 
 ```text
-/home/ubuntu/nas14/<task_name>/
-├── dataset/
-│   ├── data/             # parquet 数据
-│   ├── meta/             # LeRobot metadata
-│   ├── videos/           # 视频文件
-│   └── sync_log.jsonl    # 同步日志
-└── logs/                 # 本次采集日志
+<task_name>/
+├── dataset/    # parquet、metadata、videos、sync_log.jsonl
+└── logs/       # 每次启动的一组日志
 ```
 
-视频被拆分成多个文件是正常的，不需要手动拼接后再训练。
+LeRobot 生成多个视频文件属于正常行为，训练前不要手动拼接。
 
-## 7. 环境要求
+## 环境要求
 
-机器人上需要准备：
-
-- ROS2 Jazzy；
-- `robot_env` 环境；
-- `lerobot` 环境；
-- LeRobot 0.6 或更高版本用于 depth 录制；
-- 正常运行的手臂状态服务和相机服务。
-
-如果提示没有完整 state、相机缺失或 dataset 配置不匹配，请先检查终端输出
-和对应任务目录下的 `logs/` 文件。
-
-详细实现说明请查看 [INSTRUCTION_zh.md](INSTRUCTION_zh.md)。
+机器人需要 ROS2 Jazzy、`robot_env`、`lerobot`（depth 需要 LeRobot 0.6+）、
+正常运行的关节 state/action 服务和相机服务。同步逻辑与实现细节请看
+[INSTRUCTION_zh.md](INSTRUCTION_zh.md)。

@@ -10,9 +10,11 @@ same validation rules.
 
 from __future__ import annotations
 
-import time
 import struct
+import time
 from dataclasses import dataclass
+
+import numpy as np
 
 from camera_config import SHM_METADATA_FORMAT, CameraSpec
 
@@ -79,6 +81,29 @@ def read_shm_frame(
     if second != first:
         return None
     return ShmFrame(timestamp_ns, width, height, channels, pixel_format, expected_size, data)
+
+
+def frame_to_hwc(frame: ShmFrame, is_depth: bool, *, rgb: bool = False) -> np.ndarray:
+    """Decode one validated SHM frame into a contiguous HWC array.
+
+    RGB producers expose BGR bytes. Set ``rgb=True`` for LeRobot dataset input;
+    leave it false for consumers that perform their own BGR-to-RGB conversion.
+    Depth is always little-endian uint16 millimetres with one channel.
+    """
+
+    if is_depth:
+        if frame.pixel_format != 2 or frame.channels != 1:
+            raise ValueError(
+                f"depth camera requires pixel_format=2/channels=1, got {frame.pixel_format}/{frame.channels}"
+            )
+        return np.frombuffer(frame.data, dtype="<u2").reshape(frame.height, frame.width, 1).copy()
+
+    if frame.pixel_format != 1 or frame.channels != 3:
+        raise ValueError(
+            f"RGB camera requires pixel_format=1/channels=3, got {frame.pixel_format}/{frame.channels}"
+        )
+    image = np.frombuffer(frame.data, dtype=np.uint8).reshape(frame.height, frame.width, 3)
+    return np.ascontiguousarray(image[..., ::-1] if rgb else image)
 
 
 def shm_timestamp_sec(timestamp_ns: int, received_sec: float | None = None) -> float:
