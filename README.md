@@ -1,10 +1,17 @@
-# Autolife_VLA_Tools
+# Autolife VLA Tools
 
-Tools for collecting LeRobot datasets and running local LeRobot PI0.5 inference on an Autolife robot.
+Tools for collecting LeRobot datasets and running local PI0.5 policies on an
+Autolife robot.
 
-## Directories
+| Directory | Purpose |
+| --- | --- |
+| `lerobot_data_collector/` | Records synchronized robot state, actions, RGB, and optional depth into `LeRobotDataset`. |
+| `deploy/` | Runs a local PI0.5 checkpoint with the same camera and joint schema. |
 
-- `lerobot_data_collector/`: ROS2 and shared-memory LeRobot dataset collector.
-- `deploy/`: local PI0.5 deployment tool with optional head and waist control.
+Start with the usage guide in the relevant directory:
 
-See the README and instruction files inside each directory for usage details.
+- [Collector usage](lerobot_data_collector/README.md) / [中文](lerobot_data_collector/README_zh.md)
+- [Deployment usage](deploy/README.md)
+
+The collector implementation and synchronization guarantees are documented in
+[INSTRUCTION.md](lerobot_data_collector/INSTRUCTION.md) / [中文](lerobot_data_collector/INSTRUCTION_zh.md).

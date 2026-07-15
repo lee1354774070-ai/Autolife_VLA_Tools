@@ -267,13 +267,13 @@ def wait_for_active_cameras(
 
 
 def format_sync_report(sync_log: Path) -> str:
-    """Summarize accepted-frame deltas and drop reasons from ``sync_log``."""
+    """Summarize accepted-frame deltas, waits, and invalid episodes."""
 
     if not sync_log.is_file():
         return f"Synchronization log not found: {sync_log}"
 
     accepted_frames = 0
-    dropped_ticks: Counter[str] = Counter()
+    waiting_ticks: Counter[str] = Counter()
     invalidated_episodes: Counter[str] = Counter()
     deltas_by_source: defaultdict[str, QuantizedDeltaStats] = defaultdict(QuantizedDeltaStats)
     # Stream the JSONL file instead of loading it as one large string; long
@@ -289,15 +289,18 @@ def format_sync_report(sync_log: Path) -> str:
                 for source, delta in event.get("sync_deltas_ms", {}).items():
                     if isinstance(delta, (int, float)) and not isinstance(delta, bool):
                         deltas_by_source[source].add(float(delta))
-            elif event.get("event") == "drop":
-                dropped_ticks[str(event.get("reason", "unknown"))] += 1
+            elif event.get("event") in {"wait", "drop"}:
+                # ``drop`` is retained for reports from datasets created by
+                # older collector versions. It represented a deferred timer
+                # tick, not a discarded source frame.
+                waiting_ticks[str(event.get("reason", "unknown"))] += 1
             elif event.get("event") == "episode_invalidated":
                 invalidated_episodes[str(event.get("reason", "unknown"))] += 1
 
     lines = [
         "Synchronization report:",
         f"  accepted frames : {accepted_frames}",
-        f"  dropped ticks   : {sum(dropped_ticks.values())}",
+        f"  waiting ticks   : {sum(waiting_ticks.values())}",
         f"  invalid episodes: {sum(invalidated_episodes.values())}",
     ]
     if deltas_by_source:
@@ -306,9 +309,9 @@ def format_sync_report(sync_log: Path) -> str:
             lines.append(
                 f"    - {source}: p95={stats.percentile(0.95):.2f} ms, max={stats.maximum:.2f} ms"
             )
-    if dropped_ticks:
-        lines.append("  drop reasons:")
-        for reason, count in dropped_ticks.most_common():
+    if waiting_ticks:
+        lines.append("  wait reasons:")
+        for reason, count in waiting_ticks.most_common():
             lines.append(f"    - {reason}: {count}")
     if invalidated_episodes:
         lines.append("  episode invalidation reasons:")

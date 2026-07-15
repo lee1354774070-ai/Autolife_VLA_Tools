@@ -70,7 +70,7 @@ from camera_config import (
 )
 from robot_schema import RobotSchema, build_robot_schema, parse_gripper_command
 from cli_help import show_requested_parameter_help
-from shm_camera import ShmFrame, read_shm_frame, read_shm_metadata, shm_timestamp_sec
+from shm_camera import frame_to_hwc, read_shm_frame, read_shm_metadata, shm_timestamp_sec
 from time_sync import (
     bracketing_samples,
     frame_interval_error_ratio,
@@ -202,6 +202,13 @@ def parse_height_action(obj: Any) -> float | None:
     return None
 
 
+def parse_gripper_action(obj: Any) -> tuple[float | None, float | None] | None:
+    """Keep a gripper command only when it controls at least one gripper."""
+
+    values = parse_gripper_command(obj)
+    return values if any(value is not None for value in values) else None
+
+
 def ros_stamp_to_sec(msg: Image) -> float:
     stamp = msg.header.stamp
     if stamp.sec == 0 and stamp.nanosec == 0:
@@ -238,29 +245,6 @@ def image_msg_to_hwc(msg: Image, is_depth_map: bool) -> np.ndarray:
     if msg.encoding == "bgr8":
         image = image[..., ::-1]
     return np.ascontiguousarray(image)
-
-
-def shm_frame_to_hwc(frame: ShmFrame, is_depth_map: bool) -> np.ndarray:
-    """Convert a validated SHM frame directly to LeRobot's HWC layout."""
-
-    if is_depth_map:
-        if frame.pixel_format != 2 or frame.channels != 1:
-            raise ValueError(
-                f"depth camera requires pixel_format=2/channels=1, "
-                f"got format={frame.pixel_format}/channels={frame.channels}"
-            )
-        return np.frombuffer(frame.data, dtype="<u2").reshape(
-            frame.height, frame.width, 1
-        ).copy()
-
-    if frame.pixel_format != 1 or frame.channels != 3:
-        raise ValueError(
-            f"RGB camera requires pixel_format=1/channels=3, "
-            f"got format={frame.pixel_format}/channels={frame.channels}"
-        )
-    # Both the native camera service and the hand producer expose BGR bytes.
-    bgr = np.frombuffer(frame.data, dtype=np.uint8).reshape(frame.height, frame.width, 3)
-    return np.ascontiguousarray(bgr[..., ::-1])
 
 
 def dataset_features(
@@ -338,7 +322,8 @@ class OfficialLeRobotRecorder(Node):
         # otherwise a large historical dataset makes the reported rate huge.
         self.frames_written = 0
         self.session_frames_written = 0
-        self.frames_dropped = 0
+        self.record_ticks_waited = 0
+        self.episodes_invalidated = 0
         self.image_buffer_overflows = 0
         self.current_episode_frames = 0
         self.saved_episodes = 0
@@ -442,7 +427,11 @@ class OfficialLeRobotRecorder(Node):
             is_depth_map=is_depth_map,
         )
         buffer = self.image_buffers[camera_name]
-        if buffer.maxlen is not None and len(buffer) >= buffer.maxlen:
+        # Before the operator starts an episode, a full FIFO is expected: it
+        # simply retains a short rolling warmup window. Only an overwrite
+        # during active recording can affect saved data and must invalidate the
+        # entire episode.
+        if self.is_recording and buffer.maxlen is not None and len(buffer) >= buffer.maxlen:
             self.image_buffer_overflows += 1
             if camera_name not in self.reported_image_overflows:
                 self.reported_image_overflows.add(camera_name)
@@ -494,7 +483,7 @@ class OfficialLeRobotRecorder(Node):
             if frame is None or frame.timestamp_ns != metadata[0]:
                 continue
             try:
-                image = shm_frame_to_hwc(frame, camera_name in self.args.depth_cameras)
+                image = frame_to_hwc(frame, camera_name in self.args.depth_cameras, rgb=True)
             except ValueError as exc:
                 self.get_logger().warn(f"drop {camera_name}: {exc}")
                 continue
@@ -547,43 +536,26 @@ class OfficialLeRobotRecorder(Node):
 
         return set(self.args.cameras).issubset(self.latest_images)
 
-    def _action_arm_cb(self, msg: String) -> None:
+    def _store_action(self, msg: String, parser: Any, buffer: deque[TimedSample]) -> None:
         obj = parse_json_payload(msg.data)
         if obj is None:
             return
-        body = self.schema.parse_body_command(obj)
-        if body is not None:
-            received_sec = time.time()
-            self.action_body_buffer.append(TimedSample(body, payload_timestamp_sec(obj, received_sec), received_sec))
-
-    def _action_gripper_cb(self, msg: String) -> None:
-        obj = parse_json_payload(msg.data)
-        if obj is None:
-            return
-        left, right = parse_gripper_command(obj)
-        if left is not None or right is not None:
-            received_sec = time.time()
-            self.action_gripper_buffer.append(
-                TimedSample((left, right), payload_timestamp_sec(obj, received_sec), received_sec)
-            )
-
-    def _action_eef_cb(self, msg: String) -> None:
-        obj = parse_json_payload(msg.data)
-        if obj is None:
-            return
-        values = parse_eef_action(obj)
-        if values is not None:
-            received_sec = time.time()
-            self.action_eef_buffer.append(TimedSample(values, payload_timestamp_sec(obj, received_sec), received_sec))
-
-    def _action_height_cb(self, msg: String) -> None:
-        obj = parse_json_payload(msg.data)
-        if obj is None:
-            return
-        value = parse_height_action(obj)
+        value = parser(obj)
         if value is not None:
             received_sec = time.time()
-            self.action_height_buffer.append(TimedSample(value, payload_timestamp_sec(obj, received_sec), received_sec))
+            buffer.append(TimedSample(value, payload_timestamp_sec(obj, received_sec), received_sec))
+
+    def _action_arm_cb(self, msg: String) -> None:
+        self._store_action(msg, self.schema.parse_body_command, self.action_body_buffer)
+
+    def _action_gripper_cb(self, msg: String) -> None:
+        self._store_action(msg, parse_gripper_action, self.action_gripper_buffer)
+
+    def _action_eef_cb(self, msg: String) -> None:
+        self._store_action(msg, parse_eef_action, self.action_eef_buffer)
+
+    def _action_height_cb(self, msg: String) -> None:
+        self._store_action(msg, parse_height_action, self.action_height_buffer)
 
     def _control_fifo_loop(self) -> None:
         if not self.args.control_fifo:
@@ -983,16 +955,22 @@ class OfficialLeRobotRecorder(Node):
             },
         )
 
-    def _drop(self, reason: str, now: float, **details: Any) -> None:
-        self.frames_dropped += 1
-        self._log_sync({"event": "drop", "reason": reason, "wall_time": now, **details})
+    def _wait_for_reference(self, reason: str, now: float, **details: Any) -> None:
+        """Record a timer tick that is waiting for a usable reference frame.
+
+        No source frame is discarded here. The timer simply returns and tries
+        again after more camera and state samples enter their FIFOs.
+        """
+
+        self.record_ticks_waited += 1
+        self._log_sync({"event": "wait", "reason": reason, "wall_time": now, **details})
 
     def _invalidate_episode(self, reason: str, now: float, **details: Any) -> None:
         """Freeze the current buffer so it can never be saved as valid data."""
 
         if self.episode_invalid:
             return
-        self.frames_dropped += 1
+        self.episodes_invalidated += 1
         self.episode_invalid = True
         self.episode_invalid_reason = reason
         self.is_recording = False
@@ -1050,7 +1028,7 @@ class OfficialLeRobotRecorder(Node):
             if latest_reference is not None:
                 receive_age = now - latest_reference.received_sec
                 if receive_age <= self.args.max_image_age_sec:
-                    self._drop("no_reference_frame_ready", now)
+                    self._wait_for_reference("no_reference_frame_ready", now)
                     return
                 self._invalidate_episode(
                     "reference_camera_stalled",
@@ -1075,7 +1053,7 @@ class OfficialLeRobotRecorder(Node):
                     receive_age_ms=(now - latest_reference.received_sec) * 1000.0,
                 )
                 return
-            self._drop("no_reference_frame_ready", now)
+            self._wait_for_reference("no_reference_frame_ready", now)
             return
         reference_age = now - reference.received_sec
         if reference_age > self.args.max_image_age_sec:
@@ -1229,7 +1207,8 @@ class OfficialLeRobotRecorder(Node):
             fps = window_frames / elapsed if elapsed > 0 else 0.0
             self.get_logger().info(
                 f"frames={self.frames_written}, current_episode_frames={self.current_episode_frames}, "
-                f"saved_episodes={self.saved_episodes}, dropped={self.frames_dropped}, recording={self.is_recording}, effective_fps={fps:.2f}"
+                f"saved_episodes={self.saved_episodes}, waiting_ticks={self.record_ticks_waited}, "
+                f"invalidated={self.episodes_invalidated}, recording={self.is_recording}, effective_fps={fps:.2f}"
             )
             self.last_progress = now
             self.last_progress_frame_count = self.session_frames_written
@@ -1285,7 +1264,8 @@ class OfficialLeRobotRecorder(Node):
         self.last_reference_stamp_sec = reference_baseline
         # Start a fresh reporting window so time spent paused between episodes
         # does not artificially lower the displayed effective FPS.
-        self.last_progress = time.time()
+        self.started_sec = time.time()
+        self.last_progress = self.started_sec
         self.last_progress_frame_count = self.session_frames_written
         self._log_sync({
             "event": "episode_started",
@@ -1776,7 +1756,8 @@ def main() -> None:
         node.destroy_node()
         rclpy.shutdown()
     print(f"frames_written={node.frames_written}")
-    print(f"frames_dropped={node.frames_dropped}")
+    print(f"record_ticks_waited={node.record_ticks_waited}")
+    print(f"episodes_invalidated={node.episodes_invalidated}")
     print(f"image_buffer_overflows={node.image_buffer_overflows}")
     print(f"episodes_saved={node.saved_episodes}")
     print(f"episodes_discarded={node.discarded_episodes}")

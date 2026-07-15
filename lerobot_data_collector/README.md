@@ -1,182 +1,92 @@
-# LeRobot Collector Usage
+# LeRobot Collector
 
-This tool records robot demonstrations as an official `LeRobotDataset`. Normal
-collection uses one terminal: start the launcher and control episodes with the
-keyboard.
+Record synchronized Autolife demonstrations into an official `LeRobotDataset`.
+One terminal starts the session and controls episodes.
 
-## 1. Start
+## Start
 
 ```bash
 cd /home/ubuntu/lerobot_data_collector
-bash ./start_lerobot_official_collect.sh <task_name> "<task text>"
-```
-
-Example:
-
-```bash
 TASK_TEXT="pick up the water bottle" \
-bash ./start_lerobot_official_collect.sh pick_up_water_bottle
+bash start_lerobot_official_collect.sh pick_up_water_bottle
 ```
 
-The default dataset path is:
-
-```text
-/home/ubuntu/nas14/<task_name>/dataset/
-```
-
-## 1.1 View parameter help
-
-Show all launcher environment variables:
-
-```bash
-bash ./start_lerobot_official_collect.sh --help
-```
-
-Show one launcher variable:
-
-```bash
-bash ./start_lerobot_official_collect.sh --help MAX_SYNC_DELTA_SEC
-bash ./start_lerobot_official_collect.sh MAX_SYNC_DELTA_SEC --help
-```
-
-Show all recorder command-line options:
-
-```bash
-python ./record_lerobot_official.py --help
-```
-
-Show one recorder option:
-
-```bash
-python ./record_lerobot_official.py --max-sync-delta-sec --help
-python ./record_lerobot_official.py --with-depth --help
-```
-
-Single-option help does not require other mandatory arguments and never starts recording.
-
-Change the storage root with:
+Data is written to `/home/ubuntu/nas14/<task_name>/dataset` by default. Set
+`OUTPUT_BASE_DIR` to use another storage location.
 
 ```bash
 OUTPUT_BASE_DIR=/mnt/data \
 TASK_TEXT="put the water bottle in the box" \
-bash ./start_lerobot_official_collect.sh put_water_bottle_in_box
+bash start_lerobot_official_collect.sh put_water_bottle_in_box
 ```
 
-## 2. Episode Controls
+## Controls
 
-After the launcher prints `Interactive controls`, use the same terminal:
-
-| Key | Action |
+| Key | Result |
 | --- | --- |
-| `Enter` | Start a new episode |
-| `S` / `s` | Save the current episode and pause |
-| `D` / `d` | Discard the current episode and pause |
-| `Q` / `q` | Save a valid episode and quit |
-| `Ctrl+C` | Stop collection and clean up |
+| `Enter` | Start a new episode. |
+| `S` | Save the current valid episode and pause. |
+| `D` | Discard the current episode and pause. |
+| `Q` | Save a valid pending episode, finalize, and exit. |
+| `Ctrl+C` | Stop processes and keep saved data. |
 
-If synchronization fails, the terminal prints `EPISODE INVALID`. Press `D` to
-discard it before starting another episode.
+When the terminal prints `EPISODE INVALID`, use `D`. Invalid episodes are never
+safe to save.
 
-## 3. Common Configurations
-
-### 30 FPS with head, waist, and depth
+## Common sessions
 
 ```bash
-COLLECT_FPS=30 \
-WITH_HEAD=1 \
-WITH_WAIST=1 \
-WITH_DEPTH=1 \
-bash ./start_lerobot_official_collect.sh hotel_service
+# Base 16-D joints and three RGB cameras.
+bash start_lerobot_official_collect.sh rgb_task
+
+# 30 FPS, 23-D joints, three RGB cameras, and head depth.
+COLLECT_FPS=30 WITH_HEAD=1 WITH_WAIST=1 WITH_DEPTH=1 \
+bash start_lerobot_official_collect.sh hotel_service
+
+# Diagnostic only: head-color camera with state-as-action fallback.
+CAMERA_ONLY=1 bash start_lerobot_official_collect.sh camera_test
 ```
 
-This records:
+## Main configuration
 
-- 23-D `observation.state`;
-- 23-D default action;
-- head RGB, left-hand, right-hand, and depth cameras;
-- `hand_left` as the default synchronization reference.
-
-### Basic joints and RGB
-
-```bash
-bash ./start_lerobot_official_collect.sh rgb_test
-```
-
-### Head-color camera test
-
-```bash
-CAMERA_ONLY=1 bash ./start_lerobot_official_collect.sh camera_test
-```
-
-This mode uses state as the action fallback and is intended for camera-pipeline
-checks only.
-
-## 4. Common Variables
-
-| Variable | Default | Purpose |
+| Variable | Default | Meaning |
 | --- | --- | --- |
-| `OUTPUT_BASE_DIR` | `/home/ubuntu/nas14` | Dataset parent directory |
-| `TASK_TEXT` | task name | Task text stored in the dataset |
-| `COLLECT_FPS` | `30` | Dataset recording FPS |
-| `WITH_HEAD` | `0` | Add three neck joints |
-| `WITH_WAIST` | `0` | Add four waist/leg joints |
-| `WITH_DEPTH` | `0` | Add depth video |
-| `ACTION_MODE` | `status_target` | `status_target`, `joint`, or `eef` |
-| `IMAGE_SOURCE` | `shm` | Direct SHM or ROS image input |
-| `IMAGE_POLL_FPS` | `120` | SHM polling rate, not dataset FPS |
-| `SYNC_IMAGE_BUFFER_SIZE` | `16` | Image FIFO capacity per camera |
-| `SYNC_REFERENCE_CAMERA` | `hand_left` | Synchronization reference camera |
-| `MAX_SYNC_DELTA_SEC` | `0.03` | Maximum camera time delta |
-| `MIN_CAMERAS` | `1` | Minimum number of live cameras |
+| `TASK_TEXT` | task name | Language instruction stored with each frame. |
+| `COLLECT_FPS` | `30` | Dataset row rate. |
+| `WITH_HEAD` / `WITH_WAIST` | `0` | Append 3 neck / 4 waist joints. |
+| `WITH_DEPTH` | `0` | Add `rgbd_head_depth` as uint16 depth video. |
+| `ACTION_MODE` | `status_target` | `status_target`, `joint`, or `eef`. |
+| `IMAGE_SOURCE` | `shm` | Direct shared-memory input or `ros` topics. |
+| `SYNC_REFERENCE_CAMERA` | `hand_left` | Frame timestamp anchor. |
+| `MAX_SYNC_DELTA_SEC` | `0.03` | Largest accepted camera timestamp delta. |
+| `SYNC_IMAGE_BUFFER_SIZE` | `16` | Per-camera image FIFO capacity. |
+| `MIN_CAMERAS` | all selected | Refuse startup when any requested camera is unavailable. |
 
-Use the ROS image path with:
+Use the built-in help for every supported option:
 
 ```bash
-IMAGE_SOURCE=ros bash ./start_lerobot_official_collect.sh ros_test
+bash start_lerobot_official_collect.sh --help
+bash start_lerobot_official_collect.sh MAX_SYNC_DELTA_SEC --help
+python record_lerobot_official.py --with-depth --help
 ```
 
-## 5. Tasks and Dataset Resume
+## Resume and output
 
-`task_name` is used as:
-
-- the dataset directory name;
-- the default local repo id;
-- the task text when `TASK_TEXT` is not set.
-
-Starting the same `task_name` again resumes the existing dataset when possible.
-The camera set, FPS, depth setting, head/waist settings, and action mode must
-remain unchanged.
-
-Use a new task name or output directory when changing those features.
-
-The launcher prints the cameras actually being recorded. Check this list before
-collecting production data.
-
-## 6. Output
+Running the same `task_name` resumes its dataset only when camera features,
+FPS, joint schema, depth setting, and action mode match the existing root. Use
+a new task name or output directory after changing any of them.
 
 ```text
-/home/ubuntu/nas14/<task_name>/
-├── dataset/
-│   ├── data/             # parquet data
-│   ├── meta/             # LeRobot metadata
-│   ├── videos/           # video files
-│   └── sync_log.jsonl    # synchronization log
-└── logs/                 # collection logs
+<task_name>/
+├── dataset/    # parquet, metadata, videos, sync_log.jsonl
+└── logs/       # one log set per launcher run
 ```
 
-Multiple video files are normal. Do not concatenate them before training.
+Multiple video files are expected LeRobot output. Do not concatenate them
+before training.
 
-## 7. Requirements
+## Requirements
 
-The robot should provide:
-
-- ROS2 Jazzy;
-- the `robot_env` environment;
-- the `lerobot` environment;
-- LeRobot 0.6 or newer for depth recording;
-- running arm-state and camera services.
-
-For missing state, missing cameras, or dataset configuration errors, check the
-terminal output and the task directory's `logs/` files.
-
-See [INSTRUCTION.md](INSTRUCTION.md) for implementation details.
+The robot needs ROS2 Jazzy, `robot_env`, `lerobot` (LeRobot 0.6+ for depth),
+running robot state/action services, and camera services. See
+[INSTRUCTION.md](INSTRUCTION.md) for synchronization and implementation details.

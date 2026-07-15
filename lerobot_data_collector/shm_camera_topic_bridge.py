@@ -15,7 +15,7 @@ from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image
 
 from camera_config import CAMERA_SPECS, CameraSpec
-from shm_camera import ShmFrame, read_shm_frame
+from shm_camera import read_shm_frame, read_shm_metadata
 EPOCH_NS_MIN = 946684800 * 1_000_000_000
 EPOCH_NS_MAX = 4102444800 * 1_000_000_000
 
@@ -50,11 +50,24 @@ class ShmCameraTopicBridge(Node):
 
     def _publish_once(self) -> None:
         now = time.time()
+
+        # The SHM producer exposes only its newest frame. Snapshot metadata for
+        # every camera first, then copy image bytes only for a new generation.
+        # This prevents a high bridge poll rate from repeatedly copying the
+        # same multi-megabyte image before the camera publishes its next frame.
+        metadata_by_camera = {}
         for cam in self.cameras:
-            frame = read_shm_frame(cam)
-            if frame is None:
+            metadata = read_shm_metadata(cam)
+            if metadata is None or self.last_source_stamp.get(cam.name) == metadata[0]:
                 continue
-            if self.last_source_stamp.get(cam.name) == frame.timestamp_ns:
+            metadata_by_camera[cam.name] = metadata
+
+        for cam in self.cameras:
+            metadata = metadata_by_camera.get(cam.name)
+            if metadata is None:
+                continue
+            frame = read_shm_frame(cam, metadata)
+            if frame is None or frame.timestamp_ns != metadata[0]:
                 continue
 
             if frame.pixel_format == 1 and frame.channels == 3:

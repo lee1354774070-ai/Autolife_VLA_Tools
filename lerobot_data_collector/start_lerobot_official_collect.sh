@@ -78,7 +78,7 @@ show_help() {
             MIN_CAMERAS)
                 echo "MIN_CAMERAS"
                 echo "Usage: MIN_CAMERAS=4 bash start_lerobot_official_collect.sh task_name"
-                echo "Minimum number of valid cameras required before recording. Default: 1"
+                echo "Minimum number of valid cameras required before recording. Default: all selected cameras (3 RGB, or 4 with depth)"
                 ;;
             MAX_IMAGE_AGE_SEC|MAX_STATE_AGE_SEC|MAX_STATE_INTERPOLATION_GAP_SEC|MAX_ACTION_HOLD_SEC)
                 cli_parameter="${parameter,,}"
@@ -176,7 +176,7 @@ Common parameters:
   MAX_SYNC_DELTA_SEC         Maximum sync error in seconds. Default: 0.03
   SYNC_IMAGE_BUFFER_SIZE     Image FIFO capacity per camera. Default: 16
   SYNC_SIGNAL_BUFFER_SIZE    State/action buffer capacity. Default: 64
-  MIN_CAMERAS                Minimum valid cameras. Default: 1
+  MIN_CAMERAS                Minimum valid cameras. Default: all selected cameras
   ACTION_MODE                status_target, joint, or eef. Default: status_target
   MAX_IMAGE_AGE_SEC          Maximum image age in seconds. Default: 0.15
   MAX_STATE_AGE_SEC          Maximum joint-state age in seconds. Default: 0.15
@@ -390,9 +390,11 @@ if [ "${WITH_DEPTH}" = "1" ]; then
     BRIDGE_CAMERAS+=(rgbd_head_depth)
     RECORDER_FEATURE_ARGS+=(--with-depth)
 fi
+MIN_CAMERAS="${MIN_CAMERAS:-${#BRIDGE_CAMERAS[@]}}"
 
 echo "  joint data  : head=${WITH_HEAD}, waist=${WITH_WAIST}"
 echo "  depth data  : ${WITH_DEPTH}"
+echo "  cameras req : ${MIN_CAMERAS}/${#BRIDGE_CAMERAS[@]}"
 echo "  image FIFO  : ${SYNC_IMAGE_BUFFER_SIZE:-16} frames/camera"
 
 rm -f "${CONTROL_FIFO}" "${STATUS_FILE}" "${STATE_READY_FILE}" "${EPISODE_EVENT_FILE}"
@@ -411,7 +413,7 @@ RECORDER_ARGS=(
     --camera-warmup-sec "${CAMERA_WARMUP_SEC:-10}"
     --state-ready-file "${STATE_READY_FILE}"
     --episode-event-file "${EPISODE_EVENT_FILE}"
-    --min-cameras "${MIN_CAMERAS:-1}"
+    --min-cameras "${MIN_CAMERAS}"
     --max-sync-delta-sec "${MAX_SYNC_DELTA_SEC:-0.03}"
     --max-image-age-sec "${MAX_IMAGE_AGE_SEC:-0.15}"
     --max-state-age-sec "${MAX_STATE_AGE_SEC:-0.15}"

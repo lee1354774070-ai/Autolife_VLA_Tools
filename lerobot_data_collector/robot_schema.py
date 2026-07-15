@@ -96,6 +96,15 @@ WAIST = JointGroup(
 )
 
 BASE_GROUPS = (LEFT_ARM, RIGHT_ARM, LEFT_GRIPPER, RIGHT_GRIPPER)
+WHOLE_BODY_GROUPS = (WAIST, LEFT_ARM, RIGHT_ARM, LEFT_GRIPPER, RIGHT_GRIPPER, HEAD)
+WHOLE_BODY_DIM = sum(group.size for group in WHOLE_BODY_GROUPS)
+
+WAIST_SLICE = slice(0, 4)
+LEFT_ARM_SLICE = slice(4, 11)
+RIGHT_ARM_SLICE = slice(11, 18)
+LEFT_GRIPPER_INDEX = 18
+RIGHT_GRIPPER_INDEX = 19
+HEAD_SLICE = slice(20, 23)
 
 
 def _numeric_list(value: Any, size: int) -> list[float] | None:
@@ -231,3 +240,73 @@ def parse_gripper_command(payload: Any) -> tuple[float | None, float | None]:
     left = _top_level_positions(payload, "left_gripper_target_joints_position", 1)
     right = _top_level_positions(payload, "right_gripper_target_joints_position", 1)
     return (left[0] if left else None, right[0] if right else None)
+
+
+def parse_whole_body_state(payload: Any) -> np.ndarray | None:
+    """Parse the controller's physical q23 order from one status packet.
+
+    This order is used only at the ROS boundary. Policies always use the
+    schema order, which keeps optional head and waist joints appended after the
+    historical 16-D arm/gripper prefix.
+    """
+
+    values: list[float] = []
+    for group in WHOLE_BODY_GROUPS:
+        positions = _state_positions(payload, group)
+        if positions is None:
+            return None
+        values.extend(positions)
+    return np.asarray(values, dtype=np.float32)
+
+
+def schema_state_from_whole_body(q23: np.ndarray, schema: RobotSchema) -> np.ndarray:
+    """Convert physical q23 telemetry to a policy state in schema order."""
+
+    q = np.asarray(q23, dtype=np.float32).reshape(-1)
+    if q.size < WHOLE_BODY_DIM:
+        raise ValueError(f"Expected {WHOLE_BODY_DIM} physical joints, got {q.size}.")
+
+    values = [*q[LEFT_ARM_SLICE], *q[RIGHT_ARM_SLICE], q[LEFT_GRIPPER_INDEX], q[RIGHT_GRIPPER_INDEX]]
+    group_names = {group.name for group in schema.groups}
+    if "head" in group_names:
+        values.extend(q[HEAD_SLICE])
+    if "waist" in group_names:
+        values.extend(q[WAIST_SLICE])
+    state = np.asarray(values, dtype=np.float32)
+    if state.size != schema.size:
+        raise AssertionError(f"Schema conversion produced {state.size}, expected {schema.size}.")
+    return state
+
+
+def whole_body_from_schema_action(
+    action: np.ndarray,
+    measured_q23: np.ndarray,
+    schema: RobotSchema,
+) -> np.ndarray:
+    """Apply a schema-ordered action onto measured q23 telemetry.
+
+    Groups not enabled in ``schema`` remain at their measured positions, which
+    prevents an arm-only policy from moving the head or waist.
+    """
+
+    values = np.asarray(action, dtype=np.float32).reshape(-1)
+    if values.size < schema.size:
+        raise ValueError(f"Policy returned {values.size} dims, expected {schema.size}.")
+    q = np.asarray(measured_q23, dtype=np.float32).reshape(-1)
+    if q.size < WHOLE_BODY_DIM:
+        raise ValueError(f"Expected {WHOLE_BODY_DIM} physical joints, got {q.size}.")
+    q = q[:WHOLE_BODY_DIM].copy()
+
+    q[LEFT_ARM_SLICE] = values[: LEFT_ARM.size]
+    q[RIGHT_ARM_SLICE] = values[LEFT_ARM.size : LEFT_ARM.size + RIGHT_ARM.size]
+    q[LEFT_GRIPPER_INDEX] = values[LEFT_ARM.size + RIGHT_ARM.size]
+    q[RIGHT_GRIPPER_INDEX] = values[LEFT_ARM.size + RIGHT_ARM.size + 1]
+
+    offset = sum(group.size for group in BASE_GROUPS)
+    group_names = {group.name for group in schema.groups}
+    if "head" in group_names:
+        q[HEAD_SLICE] = values[offset : offset + HEAD.size]
+        offset += HEAD.size
+    if "waist" in group_names:
+        q[WAIST_SLICE] = values[offset : offset + WAIST.size]
+    return q

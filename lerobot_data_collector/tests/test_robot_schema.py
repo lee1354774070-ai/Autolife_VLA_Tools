@@ -7,7 +7,13 @@ import unittest
 
 import numpy as np
 
-from robot_schema import build_robot_schema, parse_gripper_command
+from robot_schema import (
+    build_robot_schema,
+    parse_gripper_command,
+    parse_whole_body_state,
+    schema_state_from_whole_body,
+    whole_body_from_schema_action,
+)
 
 
 def status_payload() -> dict:
@@ -83,6 +89,42 @@ class RobotSchemaTest(unittest.TestCase):
             parse_gripper_command({"left_gripper_target_joints_position": [0.5]}),
             (0.5, None),
         )
+
+    def test_whole_body_conversion_keeps_policy_order_and_disabled_groups(self) -> None:
+        measured = parse_whole_body_state(status_payload())
+        np.testing.assert_array_equal(
+            measured,
+            np.array([41, 42, 43, 44, *range(1, 8), *range(11, 18), 21, 22, 31, 32, 33], dtype=np.float32),
+        )
+
+        base_schema = build_robot_schema()
+        np.testing.assert_array_equal(
+            schema_state_from_whole_body(measured, base_schema),
+            np.array([*range(1, 8), *range(11, 18), 21, 22], dtype=np.float32),
+        )
+
+        action = np.arange(100, 116, dtype=np.float32)
+        commanded = whole_body_from_schema_action(action, measured, base_schema)
+        np.testing.assert_array_equal(commanded[:4], measured[:4])
+        np.testing.assert_array_equal(commanded[20:], measured[20:])
+        np.testing.assert_array_equal(commanded[4:20], action)
+
+    def test_whole_body_conversion_appends_head_then_waist(self) -> None:
+        measured = parse_whole_body_state(status_payload())
+        schema = build_robot_schema(with_head=True, with_waist=True)
+        np.testing.assert_array_equal(
+            schema_state_from_whole_body(measured, schema),
+            np.array(
+                [*range(1, 8), *range(11, 18), 21, 22, 31, 32, 33, 41, 42, 43, 44],
+                dtype=np.float32,
+            ),
+        )
+
+        action = np.arange(100, 123, dtype=np.float32)
+        commanded = whole_body_from_schema_action(action, measured, schema)
+        np.testing.assert_array_equal(commanded[4:20], action[:16])
+        np.testing.assert_array_equal(commanded[20:23], action[16:19])
+        np.testing.assert_array_equal(commanded[:4], action[19:23])
 
 
 if __name__ == "__main__":

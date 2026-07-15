@@ -105,20 +105,21 @@ class CollectorControlTest(unittest.TestCase):
                 ["hand_left", "rgbd_head_color"],
             )
 
-    def test_sync_report_summarizes_deltas_and_drops(self) -> None:
+    def test_sync_report_summarizes_deltas_and_waits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             sync_log = Path(temporary_dir) / "sync_log.jsonl"
             events = [
                 {"event": "frame", "sync_deltas_ms": {"state": -4.0, "image:hand_left": 8.0}},
                 {"event": "frame", "sync_deltas_ms": {"state": 6.0, "image:hand_left": -12.0}},
-                {"event": "drop", "reason": "unsynchronized_state"},
+                {"event": "wait", "reason": "no_reference_frame_ready"},
                 {"event": "episode_invalidated", "reason": "reference_frame_interval"},
             ]
             sync_log.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
             report = format_sync_report(sync_log)
             self.assertIn("accepted frames : 2", report)
             self.assertIn("state: p95=6.00 ms, max=6.00 ms", report)
-            self.assertIn("unsynchronized_state: 1", report)
+            self.assertIn("waiting ticks   : 1", report)
+            self.assertIn("no_reference_frame_ready: 1", report)
             self.assertIn("invalid episodes: 1", report)
             self.assertIn("reference_frame_interval: 1", report)
 
