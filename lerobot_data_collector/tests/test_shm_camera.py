@@ -6,7 +6,14 @@ from pathlib import Path
 import numpy as np
 
 from camera_config import SHM_METADATA_FORMAT, CameraSpec
-from shm_camera import ShmFrame, frame_to_hwc, read_shm_frame, read_shm_metadata, shm_timestamp_sec
+from shm_camera import (
+    SHM2_HEADER_FORMAT,
+    ShmFrame,
+    frame_to_hwc,
+    read_shm_frame,
+    read_shm_metadata,
+    shm_timestamp_sec,
+)
 
 
 class ShmCameraTest(unittest.TestCase):
@@ -33,6 +40,48 @@ class ShmCameraTest(unittest.TestCase):
 
     def test_non_epoch_timestamp_falls_back_to_receive_time(self):
         self.assertEqual(shm_timestamp_sec(123, 42.5), 42.5)
+
+    def test_shm2_reader_selects_the_active_image_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = CameraSpec(
+                name="test",
+                meta_path=str(root / "meta"),
+                buffer_path=str(root / "buffer"),
+                topic="/test",
+                frame_id="test",
+            )
+            timestamp_ns = 1_700_000_000_000_000_000
+            header = struct.pack(
+                SHM2_HEADER_FORMAT,
+                b"SHM2",
+                2,
+                2,
+                1,
+                84,
+                42,
+                2,
+                1,
+                3,
+                1,
+                6,
+                struct.unpack("<I", b"BGR\0")[0],
+                7,
+                6,
+                123,
+                timestamp_ns,
+            )
+            Path(spec.meta_path).write_bytes(header.ljust(256, b"\0"))
+            Path(spec.buffer_path).write_bytes(b"oldold" + b"newnew")
+
+            parsed = read_shm_metadata(spec)
+            frame = read_shm_frame(spec, parsed)
+
+            self.assertIsNotNone(parsed)
+            self.assertEqual(parsed[:6], (timestamp_ns, 2, 1, 3, 1, 6))
+            self.assertEqual(parsed[6], 6)
+            self.assertIsNotNone(frame)
+            self.assertEqual(frame.data, b"newnew")
 
     def test_frame_decoder_handles_bgr_and_depth(self):
         rgb_frame = ShmFrame(1, 1, 1, 3, 1, 3, b"\x01\x02\x03")

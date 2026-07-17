@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import signal
@@ -172,10 +173,68 @@ def depth_to_policy_chw(
     return result
 
 
-def load_policy(model_dir: Path, device: str, tokenizer_dir: Path | None = None):
+def configure_policy_compilation(config: Any, compile_mode: str) -> None:
+    """Apply a deployment-time torch.compile override to a saved config."""
+
+    if compile_mode == "checkpoint":
+        return
+    if compile_mode == "disabled":
+        config.compile_model = False
+        return
+    config.compile_model = True
+    config.compile_mode = compile_mode
+
+
+def configure_policy_runtime(
+    config: Any,
+    n_action_steps: int | None,
+    rtc_enabled: bool,
+    rtc_execution_horizon: int,
+    rtc_max_guidance_weight: float,
+) -> None:
+    """Apply action-chunk and RTC overrides before constructing PI0.5."""
+
+    chunk_size = int(config.chunk_size)
+    if n_action_steps is not None:
+        if not 1 <= n_action_steps <= chunk_size:
+            raise ValueError(
+                f"n_action_steps must be in [1, {chunk_size}], got {n_action_steps}."
+            )
+        config.n_action_steps = n_action_steps
+
+    if not rtc_enabled:
+        config.rtc_config = None
+        return
+    if not 1 <= rtc_execution_horizon <= chunk_size:
+        raise ValueError(
+            f"RTC execution horizon must be in [1, {chunk_size}], "
+            f"got {rtc_execution_horizon}."
+        )
+    try:
+        from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    except ImportError as exc:
+        raise RuntimeError("RTC requires LeRobot 0.6 or newer.") from exc
+    config.rtc_config = RTCConfig(
+        enabled=True,
+        execution_horizon=rtc_execution_horizon,
+        max_guidance_weight=rtc_max_guidance_weight,
+    )
+
+
+def load_policy(
+    model_dir: Path,
+    device: str,
+    tokenizer_dir: Path | None = None,
+    compile_mode: str = "checkpoint",
+    n_action_steps: int | None = None,
+    rtc_enabled: bool = False,
+    rtc_execution_horizon: int = 10,
+    rtc_max_guidance_weight: float = 10.0,
+):
     """Load a PI0.5 policy together with its saved I/O processors."""
 
     try:
+        from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies import make_pre_post_processors
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
     except ImportError as exc:
@@ -183,7 +242,17 @@ def load_policy(model_dir: Path, device: str, tokenizer_dir: Path | None = None)
             "Cannot import PI05Policy. Activate the LeRobot environment used for training."
         ) from exc
 
-    policy = PI05Policy.from_pretrained(str(model_dir))
+    config = PreTrainedConfig.from_pretrained(str(model_dir))
+    config.device = device
+    configure_policy_compilation(config, compile_mode)
+    configure_policy_runtime(
+        config,
+        n_action_steps,
+        rtc_enabled,
+        rtc_execution_horizon,
+        rtc_max_guidance_weight,
+    )
+    policy = PI05Policy.from_pretrained(str(model_dir), config=config)
     policy = policy.to(device).eval()
     preprocessor_overrides: dict[str, dict[str, str]] = {}
     if tokenizer_dir is not None:
@@ -338,6 +407,7 @@ class InferredAction:
     action: np.ndarray
     command_q23: np.ndarray
     elapsed_ms: float
+    inference_ms: float | None = None
 
 
 class DirectShmCamera:
@@ -348,7 +418,7 @@ class DirectShmCamera:
         self.is_depth = is_depth
         self.last_timestamp_ns: int | None = None
 
-    def read_latest(self, metadata: tuple[int, int, int, int, int, int]) -> ShmImage | None:
+    def read_latest(self, metadata: tuple[int, ...]) -> ShmImage | None:
         if self.last_timestamp_ns == metadata[0]:
             return None
         frame = read_shm_frame(self.spec, metadata)
@@ -412,6 +482,217 @@ class DirectShmCameraSet:
             selected[name] = image
         return selected
 
+
+def _normalize_rtc_prefix(actions: torch.Tensor, target_steps: int) -> torch.Tensor:
+    """Keep RTC prefix shapes stable so torch.compile does not recompile each refresh."""
+
+    if actions.ndim != 2:
+        raise ValueError(f"RTC prefix must have shape [steps, actions], got {tuple(actions.shape)}.")
+    if len(actions) >= target_steps:
+        return actions[:target_steps]
+    padded = torch.zeros(
+        (target_steps, actions.shape[1]),
+        dtype=actions.dtype,
+        device=actions.device,
+    )
+    padded[: len(actions)] = actions
+    return padded
+
+
+class RTCActionEngine:
+    """Run PI0.5 chunk inference asynchronously and merge overlapping chunks.
+
+    The main robot loop only supplies the newest observation and consumes one
+    queued action. This worker owns policy inference, so camera/state polling
+    and command publication can continue while the next chunk is generated.
+    """
+
+    def __init__(
+        self,
+        policy: Any,
+        preprocessor: Any,
+        postprocessor: Any,
+        policy_lock: threading.RLock,
+        hz: float,
+        refresh_steps: int,
+    ) -> None:
+        try:
+            from lerobot.policies.rtc import ActionQueue, LatencyTracker, reanchor_relative_rtc_prefix
+            from lerobot.processor import NormalizerProcessorStep, RelativeActionsProcessorStep
+        except ImportError as exc:
+            raise RuntimeError("RTC requires the LeRobot 0.6 RTC modules.") from exc
+
+        self.policy = policy
+        self.preprocessor = preprocessor
+        self.postprocessor = postprocessor
+        self.policy_lock = policy_lock
+        self.config = policy.config.rtc_config
+        self.refresh_steps = refresh_steps
+        self.period_sec = 1.0 / hz
+        self.queue = ActionQueue(self.config)
+        self.latencies = LatencyTracker()
+        self.reanchor_relative_rtc_prefix = reanchor_relative_rtc_prefix
+
+        steps = getattr(preprocessor, "steps", ())
+        self.relative_step = next(
+            (step for step in steps if isinstance(step, RelativeActionsProcessorStep) and step.enabled),
+            None,
+        )
+        self.normalizer_step = next(
+            (step for step in steps if isinstance(step, NormalizerProcessorStep)),
+            None,
+        )
+        if self.relative_step is not None and self.relative_step.action_names is None:
+            names = getattr(policy.config, "action_feature_names", None)
+            if names:
+                self.relative_step.action_names = list(names)
+
+        self._state_lock = threading.Lock()
+        self._latest_observation: dict[str, Any] | None = None
+        self._generation = 0
+        self._error: Exception | None = None
+        self._inference_count = 0
+        self._last_inference_ms = 0.0
+        self._active = threading.Event()
+        self._shutdown = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="PI05-RTC", daemon=True)
+        self._thread.start()
+
+    @property
+    def last_inference_ms(self) -> float:
+        with self._state_lock:
+            return self._last_inference_ms
+
+    @property
+    def inference_count(self) -> int:
+        with self._state_lock:
+            return self._inference_count
+
+    def _reset_pipeline(self) -> None:
+        self.policy.reset()
+        for processor in (self.preprocessor, self.postprocessor):
+            if hasattr(processor, "reset"):
+                processor.reset()
+
+    def start_task(self) -> None:
+        """Invalidate old work, reset all chunk state, and resume inference."""
+
+        self._active.clear()
+        with self._state_lock:
+            self._generation += 1
+            self._latest_observation = None
+            self._error = None
+        with self.policy_lock:
+            self._reset_pipeline()
+            self.queue.clear()
+            self.latencies.reset()
+        self._active.set()
+
+    def pause(self) -> None:
+        """Stop generating and discard actions based on the paused observation."""
+
+        self._active.clear()
+        with self._state_lock:
+            self._generation += 1
+            self._latest_observation = None
+        self.queue.clear()
+
+    def stop(self) -> None:
+        self.pause()
+        self._shutdown.set()
+        self._thread.join(timeout=5.0)
+        if self._thread.is_alive():
+            print("Warning: RTC inference thread did not stop within 5 seconds.")
+
+    def notify_observation(self, observation: dict[str, Any]) -> None:
+        with self._state_lock:
+            self._latest_observation = observation
+
+    def get_action(self) -> torch.Tensor | None:
+        with self._state_lock:
+            error = self._error
+        if error is not None:
+            raise RuntimeError(f"RTC background inference failed: {error}") from error
+        return self.queue.get()
+
+    def _postprocess_chunk(self, actions: torch.Tensor) -> torch.Tensor:
+        processed = self.postprocessor(actions)
+        if isinstance(processed, dict):
+            processed = processed.get("action")
+        if not isinstance(processed, torch.Tensor):
+            processed = torch.as_tensor(processed)
+        if processed.ndim == 3 and processed.shape[0] == 1:
+            processed = processed.squeeze(0)
+        if processed.ndim != 2:
+            raise ValueError(f"RTC postprocessor returned shape {tuple(processed.shape)}.")
+        return processed
+
+    def _run(self) -> None:
+        while not self._shutdown.is_set():
+            if not self._active.is_set():
+                time.sleep(0.01)
+                continue
+            with self._state_lock:
+                observation = self._latest_observation
+                generation = self._generation
+            needs_chunk = self.queue.empty() or self.queue.get_action_index() >= self.refresh_steps
+            if observation is None or not needs_chunk:
+                time.sleep(0.005)
+                continue
+
+            try:
+                started = time.perf_counter()
+                action_index = self.queue.get_action_index()
+                previous = self.queue.get_left_over()
+                predicted_delay = math.ceil((self.latencies.max() or 0.0) / self.period_sec)
+
+                with self.policy_lock, torch.inference_mode():
+                    batch = self.preprocessor(observation)
+                    if previous is not None and self.relative_step is not None:
+                        raw_state = self.relative_step.get_cached_state()
+                        previous_absolute = self.queue.get_processed_left_over()
+                        if raw_state is not None and previous_absolute is not None:
+                            previous = self.reanchor_relative_rtc_prefix(
+                                prev_actions_absolute=previous_absolute,
+                                current_state=raw_state,
+                                relative_step=self.relative_step,
+                                normalizer_step=self.normalizer_step,
+                                policy_device=next(self.policy.parameters()).device,
+                            )
+                    if previous is not None:
+                        previous = _normalize_rtc_prefix(
+                            previous,
+                            self.config.execution_horizon,
+                        )
+                    actions = self.policy.predict_action_chunk(
+                        batch,
+                        inference_delay=predicted_delay,
+                        prev_chunk_left_over=previous,
+                    )
+                    original = actions.squeeze(0).clone()
+                    processed = self._postprocess_chunk(actions)
+
+                elapsed = time.perf_counter() - started
+                self.latencies.add(elapsed)
+                # Count actions actually consumed while inference was running.
+                # This is more accurate than dropping actions from wall time
+                # when the queue was already empty and the robot was waiting.
+                actual_delay = max(0, self.queue.get_action_index() - action_index)
+                with self._state_lock:
+                    stale = generation != self._generation or not self._active.is_set()
+                if stale:
+                    continue
+                self.queue.merge(original, processed, actual_delay, action_index)
+                with self._state_lock:
+                    self._inference_count += 1
+                    self._last_inference_ms = elapsed * 1000.0
+            except Exception as exc:
+                with self._state_lock:
+                    self._error = exc
+                self._active.clear()
+                print(f"RTC inference stopped: {exc}")
+
+
 class LocalPI05Deployer:
     """Coordinate state/image snapshots, policy inference, and robot commands.
 
@@ -435,6 +716,7 @@ class LocalPI05Deployer:
         self.policy: Any | None = None
         self.policy_preprocessor: Any | None = None
         self.policy_postprocessor: Any | None = None
+        self.rtc_engine: RTCActionEngine | None = None
         self.model_enabled = False
 
         contract_state, contract_action, contract_images, contract_action_names = read_model_contract(args.model_dir)
@@ -499,6 +781,35 @@ class LocalPI05Deployer:
         print(f"policy state/action dimensions: {self.schema.size}/{self.contract_action_dim or 'unknown'}")
         print(f"camera inputs: {', '.join(self.args.camera_names)}")
         print(f"camera source: direct SHM, reference={self.args.sync_reference_camera}")
+        assert self.policy is not None
+        print(f"action chunk: size={self.policy.config.chunk_size}, n_action_steps={self.policy.config.n_action_steps}")
+        if self.args.rtc:
+            print(
+                f"RTC: enabled, execution_horizon={self.args.rtc_execution_horizon}, "
+                f"refresh_steps={self._rtc_refresh_steps()}"
+            )
+        else:
+            print("RTC: disabled")
+
+    def _rtc_refresh_steps(self) -> int:
+        """Resolve the upstream default queue threshold to consumed steps."""
+
+        assert self.policy is not None
+        chunk_size = int(self.policy.config.chunk_size)
+        # LeRobot's RTCInferenceEngine defaults to refreshing when 30 actions
+        # remain. For a 50-step PI0.5 chunk, that is after 20 consumed steps.
+        steps = self.args.rtc_refresh_steps
+        steps = max(1, chunk_size - 30) if steps is None else steps
+        if not 1 <= steps <= chunk_size:
+            raise ValueError(f"rtc_refresh_steps must be in [1, {chunk_size}], got {steps}.")
+        return steps
+
+    def _reset_policy_pipeline(self) -> None:
+        assert self.policy is not None
+        self.policy.reset()
+        for processor in (self.policy_preprocessor, self.policy_postprocessor):
+            if hasattr(processor, "reset"):
+                processor.reset()
 
     def enable(self) -> None:
         """Load and compile the model once without publishing a robot command."""
@@ -514,6 +825,11 @@ class LocalPI05Deployer:
                     self.args.model_dir,
                     self.args.device,
                     self.args.tokenizer_dir,
+                    self.args.compile_mode,
+                    self.args.n_action_steps,
+                    self.args.rtc,
+                    self.args.rtc_execution_horizon,
+                    self.args.rtc_max_guidance_weight,
                 )
                 self._print_model_summary()
 
@@ -530,11 +846,31 @@ class LocalPI05Deployer:
         # caches. It intentionally never reaches publish_action(). Resetting
         # afterwards discards the warm-up action chunk before a real task.
         print("Warming up PI0.5 policy without publishing commands...")
-        self.select_action(q23, self.args.task)
         with self._policy_lock:
             assert self.policy is not None
-            if hasattr(self.policy, "reset"):
-                self.policy.reset()
+            if self.args.rtc:
+                assert self.policy_preprocessor is not None
+                assert self.policy_postprocessor is not None
+                observation = self.build_observation(q23, self.args.task)
+                with torch.inference_mode():
+                    chunk = self.policy.predict_action_chunk(
+                        self.policy_preprocessor(observation),
+                        inference_delay=0,
+                        prev_chunk_left_over=None,
+                    )
+                    self.policy_postprocessor(chunk)
+            else:
+                self.select_action(q23, self.args.task)
+            self._reset_policy_pipeline()
+            if self.args.rtc:
+                self.rtc_engine = RTCActionEngine(
+                    self.policy,
+                    self.policy_preprocessor,
+                    self.policy_postprocessor,
+                    self._policy_lock,
+                    self.args.hz,
+                    self._rtc_refresh_steps(),
+                )
             self.model_enabled = True
         print("Model enabled and ready. Use: start <task text>")
 
@@ -544,11 +880,19 @@ class LocalPI05Deployer:
         task = task.strip()
         if not task:
             raise ValueError("start requires task text, for example: start pick up the water bottle")
+        if not self.model_enabled or self.policy is None:
+            raise RuntimeError("Model is not enabled. Run enable first.")
+        if self.rtc_engine is not None:
+            self.rtc_engine.start_task()
+            return
         with self._policy_lock:
-            if not self.model_enabled or self.policy is None:
-                raise RuntimeError("Model is not enabled. Run enable first.")
-            if hasattr(self.policy, "reset"):
-                self.policy.reset()
+            self._reset_policy_pipeline()
+
+    def pause_task(self) -> None:
+        """Pause RTC immediately and invalidate its queued or in-flight actions."""
+
+        if self.rtc_engine is not None:
+            self.rtc_engine.pause()
 
     def infer_step(self, task: str) -> InferredAction | None:
         """Infer one fresh action without publishing it to the robot."""
@@ -563,12 +907,26 @@ class LocalPI05Deployer:
         if now - self.latest_image_received_sec > self.args.max_image_age_sec:
             return None
 
-        with self._policy_lock:
-            if not self.model_enabled or self.policy is None:
+        if not self.model_enabled or self.policy is None:
+            return None
+        inference_ms = None
+        if self.rtc_engine is not None:
+            self.rtc_engine.notify_observation(self.build_observation(q23, task))
+            queued_action = self.rtc_engine.get_action()
+            if queued_action is None:
                 return None
-            action = self.select_action(q23, task)
-            command_q23 = whole_body_from_schema_action(action, q23, self.schema)
-        return InferredAction(action, command_q23, (time.monotonic() - loop_started) * 1000.0)
+            action = self._action_array(queued_action)
+            inference_ms = self.rtc_engine.last_inference_ms
+        else:
+            with self._policy_lock:
+                action = self.select_action(q23, task)
+        command_q23 = whole_body_from_schema_action(action, q23, self.schema)
+        return InferredAction(
+            action,
+            command_q23,
+            (time.monotonic() - loop_started) * 1000.0,
+            inference_ms,
+        )
 
     def publish_command(self, command_q23: np.ndarray) -> None:
         """Publish a command already approved by the session state machine."""
@@ -580,6 +938,9 @@ class LocalPI05Deployer:
 
     def close(self) -> None:
         self.stop_requested = True
+        if self.rtc_engine is not None:
+            self.rtc_engine.stop()
+            self.rtc_engine = None
         if self.executor is not None:
             try:
                 self.executor.shutdown()
@@ -679,6 +1040,11 @@ class LocalPI05Deployer:
             # action values using the checkpoint's training statistics.
             action = self.policy.select_action(self.policy_preprocessor(observation))
             action = self.policy_postprocessor(action)
+        return self._action_array(action)
+
+    def _action_array(self, action: Any) -> np.ndarray:
+        """Convert one postprocessed LeRobot action to the selected robot schema."""
+
         if isinstance(action, dict):
             action = action.get("action")
         if isinstance(action, torch.Tensor):
@@ -724,8 +1090,13 @@ class LocalPI05Deployer:
             action, elapsed_ms = result.action, result.elapsed_ms
 
             if step % max(1, self.args.print_every) == 0:
+                rtc_text = (
+                    f" vlm_ms={result.inference_ms:.1f}"
+                    if result.inference_ms is not None
+                    else ""
+                )
                 print(
-                    f"step={step} loop_ms={elapsed_ms:.1f} "
+                    f"step={step} loop_ms={elapsed_ms:.1f}{rtc_text} "
                     f"left_gripper={action[14]:.3f} right_gripper={action[15]:.3f}"
                 )
             step += 1
@@ -754,6 +1125,7 @@ class InteractiveDeploymentSession:
     def request_exit(self) -> None:
         self._exit_requested.set()
         self.control.request_exit()
+        self.deployer.pause_task()
         self.deployer.stop_requested = True
 
     def _enable(self) -> None:
@@ -784,6 +1156,7 @@ class InteractiveDeploymentSession:
 
     def _stop(self) -> None:
         if self.control.pause():
+            self.deployer.pause_task()
             print("Inference paused. The model remains loaded; use continue to resume.")
         else:
             print("Inference is not running.")
@@ -882,8 +1255,13 @@ class InteractiveDeploymentSession:
             if not published:
                 continue
             if snapshot.step % max(1, self.deployer.args.print_every) == 0:
+                rtc_text = (
+                    f" vlm_ms={result.inference_ms:.1f}"
+                    if result.inference_ms is not None
+                    else ""
+                )
                 print(
-                    f"step={snapshot.step} loop_ms={result.elapsed_ms:.1f} "
+                    f"step={snapshot.step} loop_ms={result.elapsed_ms:.1f}{rtc_text} "
                     f"left_gripper={result.action[14]:.3f} right_gripper={result.action[15]:.3f}"
                 )
             reached_limit = self.control.record_published_step(
@@ -891,6 +1269,7 @@ class InteractiveDeploymentSession:
                 self.deployer.args.max_steps,
             )
             if reached_limit:
+                self.deployer.pause_task()
                 print("Maximum step count reached; inference paused.")
 
             next_deadline += period_sec
@@ -902,18 +1281,31 @@ class InteractiveDeploymentSession:
 
 
 def parse_args() -> argparse.Namespace:
-    repo_default = Path(os.getenv("MODEL_DIR", str(REPO_DIR / "004500" / "pretrained_model")))
+    model_dir_env = os.getenv("MODEL_DIR")
+    require_model_dir = env_bool("PI05_REQUIRE_MODEL_DIR", False) and not model_dir_env
+    repo_default = (
+        None
+        if require_model_dir
+        else Path(model_dir_env or str(REPO_DIR / "004500" / "pretrained_model"))
+    )
+    script_name = Path(sys.argv[0]).name
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  deploy_pi05.py --model-dir /home/ubuntu/004500/pretrained_model --task 'pick up the bottle'\n"
-            "  deploy_pi05.py --with-head --with-waist --with-depth --dry-run --max-steps 30\n"
-            "  deploy_pi05.py --with-head --help"
+            f"  {script_name} --model-dir /home/ubuntu/model --task 'pick up the bottle'\n"
+            f"  {script_name} --with-head --with-waist --with-depth --dry-run --max-steps 30\n"
+            f"  {script_name} --with-head --help"
         ),
     )
-    parser.add_argument("--model-dir", type=Path, default=repo_default, help="Local LeRobot pretrained_model directory to load.")
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=repo_default,
+        required=require_model_dir,
+        help="Local LeRobot model directory to load.",
+    )
     parser.add_argument(
         "--tokenizer-dir",
         type=Path,
@@ -930,6 +1322,61 @@ def parse_args() -> argparse.Namespace:
         help="Keep the process alive and accept enable/start/stop/continue/exit commands from the terminal.",
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Torch device used for policy inference, such as cuda or cpu.")
+    parser.add_argument(
+        "--compile-mode",
+        choices=(
+            "checkpoint",
+            "disabled",
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ),
+        default=os.getenv("PI05_COMPILE_MODE", "checkpoint"),
+        help=(
+            "Override the checkpoint torch.compile setting. checkpoint preserves its config; "
+            "disabled runs eager PyTorch."
+        ),
+    )
+    parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        default=int(os.environ["N_ACTION_STEPS"]) if os.getenv("N_ACTION_STEPS") else None,
+        help=(
+            "Number of actions executed from each chunk before non-RTC PI0.5 infers again. "
+            "Omit to preserve the checkpoint value; RTC uses --rtc-refresh-steps instead."
+        ),
+    )
+    parser.add_argument(
+        "--rtc",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("PI05_RTC", False),
+        help=(
+            "Enable asynchronous Real-Time Chunking. The control loop consumes queued actions "
+            "while PI0.5 refreshes a corrected chunk from the newest observation."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-refresh-steps",
+        type=int,
+        default=int(os.environ["RTC_REFRESH_STEPS"]) if os.getenv("RTC_REFRESH_STEPS") else None,
+        help=(
+            "Start the next RTC VLM inference after this many actions from the latest chunk. "
+            "Omit to derive 20 steps from LeRobot's 30-actions-remaining default for chunk_size=50."
+        ),
+    )
+    parser.add_argument(
+        "--rtc-execution-horizon",
+        type=int,
+        default=int(os.getenv("RTC_EXECUTION_HORIZON", "10")),
+        help="Number of leftover actions supplied as the RTC correction prefix.",
+    )
+    parser.add_argument(
+        "--rtc-max-guidance-weight",
+        type=float,
+        default=float(os.getenv("RTC_MAX_GUIDANCE_WEIGHT", "10.0")),
+        help="Maximum RTC prefix-guidance weight used during action denoising.",
+    )
     parser.add_argument("--hz", type=float, default=10.0, help="Robot command publication and inference loop frequency in Hz.")
     parser.add_argument("--max-steps", type=int, default=0, help="Maximum inference steps; 0 runs until Ctrl-C.")
     parser.add_argument("--warmup-sec", type=float, default=10.0, help="Maximum time to wait for a complete joint state and camera frame.")
@@ -1017,6 +1464,10 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit(f"Model directory does not exist: {args.model_dir}")
     if (
         args.hz <= 0
+        or (args.n_action_steps is not None and args.n_action_steps <= 0)
+        or (args.rtc_refresh_steps is not None and args.rtc_refresh_steps <= 0)
+        or args.rtc_execution_horizon <= 0
+        or args.rtc_max_guidance_weight <= 0
         or args.max_steps < 0
         or args.warmup_sec <= 0
         or args.start_delay_sec < 0
@@ -1028,8 +1479,8 @@ def parse_args() -> argparse.Namespace:
         or args.depth_max <= args.depth_min
     ):
         raise SystemExit(
-            "hz, warmup, print interval, freshness limits, image delta, and depth range must be "
-            "positive; max steps and start delay cannot be negative."
+            "Action/RTC settings, hz, warmup, print interval, freshness limits, image delta, "
+            "and depth range must be positive; max steps and start delay cannot be negative."
         )
     return args
 

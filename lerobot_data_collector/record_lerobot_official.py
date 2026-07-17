@@ -466,7 +466,7 @@ class OfficialLeRobotRecorder(Node):
         ``read_shm_frame`` rejects that generation and the next poll retries it.
         """
 
-        metadata_by_camera: dict[str, tuple[int, int, int, int, int, int]] = {}
+        metadata_by_camera: dict[str, tuple[int, ...]] = {}
         for camera_name in self.args.cameras:
             spec = CAMERA_SPECS[camera_name]
             metadata = read_shm_metadata(spec)
@@ -1007,6 +1007,42 @@ class OfficialLeRobotRecorder(Node):
             if buffer.popleft() is selected:
                 return
 
+    def _wait_for_camera_buffers(self, now: float) -> bool:
+        """Wait for every active camera to contribute its next FIFO sample.
+
+        Starting an episode clears the warmup FIFOs. Cameras are independent,
+        so one stream can publish its first post-start frame before another.
+        Treating that short phase offset as a missing camera would invalidate an
+        otherwise healthy episode before its first dataset frame is written.
+
+        A stream is only considered failed when its latest received frame has
+        exceeded ``max_image_age_sec`` (or no frame has ever been received).
+        """
+
+        waiting_for: list[str] = []
+        for camera_name in self.active_cameras:
+            if self.image_buffers[camera_name]:
+                continue
+
+            latest = self.latest_images.get(camera_name)
+            is_reference = camera_name == self.sync_reference_camera
+            if latest is None:
+                reason = "missing_reference_camera" if is_reference else f"missing_camera:{camera_name}"
+                self._invalidate_episode(reason, now)
+                return True
+
+            receive_age = now - latest.received_sec
+            if receive_age > self.args.max_image_age_sec:
+                reason = "reference_camera_stalled" if is_reference else f"camera_stalled:{camera_name}"
+                self._invalidate_episode(reason, now, receive_age_ms=receive_age * 1000.0)
+                return True
+            waiting_for.append(camera_name)
+
+        if not waiting_for:
+            return False
+        self._wait_for_reference("camera_frames_not_ready", now, cameras=waiting_for)
+        return True
+
     def _record_tick(self) -> None:
         if self.stop_requested or self.dataset is None or not self.is_recording:
             return
@@ -1019,24 +1055,7 @@ class OfficialLeRobotRecorder(Node):
         if reference_name is None:
             self._invalidate_episode("missing_reference_camera", now)
             return
-        if not self.image_buffers[reference_name]:
-            # A new episode clears warmup FIFOs. The first record tick can run
-            # before the next direct-SHM poll or ROS callback repopulates the
-            # reference FIFO, so wait briefly instead of invalidating a healthy
-            # camera at the episode boundary.
-            latest_reference = self.latest_images.get(reference_name)
-            if latest_reference is not None:
-                receive_age = now - latest_reference.received_sec
-                if receive_age <= self.args.max_image_age_sec:
-                    self._wait_for_reference("no_reference_frame_ready", now)
-                    return
-                self._invalidate_episode(
-                    "reference_camera_stalled",
-                    now,
-                    receive_age_ms=receive_age * 1000.0,
-                )
-                return
-            self._invalidate_episode("missing_reference_camera", now)
+        if self._wait_for_camera_buffers(now):
             return
         reference = oldest_ready_sample(
             self.image_buffers[reference_name],

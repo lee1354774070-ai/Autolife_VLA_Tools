@@ -12,9 +12,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-# Autolife camera producers use this little-endian binary metadata layout:
+# Legacy Autolife camera producers use this little-endian metadata layout:
 # timestamp_ns (int64), followed by width, height, channels, pixel format, and
-# byte count (five int32 values).
+# byte count (five int32 values). ``shm_camera`` also detects and parses the
+# newer SHM2 ring/double-buffer protocol used by current robot SDK releases.
 SHM_METADATA_FORMAT = "<qiiiii"
 
 # Runtime defaults shared by the recorder and its documentation. The shell
