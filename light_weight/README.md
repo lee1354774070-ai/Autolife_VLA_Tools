@@ -79,7 +79,7 @@ unattended robot motion.
 Deploy the finished artifact with the repository's dedicated entry point:
 
 ```bash
-python ../deploy/deploy_pi05_light_weight.py \
+python ../deploy/pi05/deploy_pi05_light_weight.py \
   --interactive \
   --model-dir /path/to/pi05_int8wo \
   --tokenizer-dir /path/to/paligemma-tokenizer \

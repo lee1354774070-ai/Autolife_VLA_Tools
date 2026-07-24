@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from session_control import SessionControl
+from deploy.common.session_control import SessionControl
 
 
 class SessionControlTest(unittest.TestCase):

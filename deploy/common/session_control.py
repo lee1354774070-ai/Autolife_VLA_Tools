@@ -1,4 +1,4 @@
-"""Thread-safe command state for the persistent PI0.5 deployment session."""
+"""Thread-safe command state for persistent robot deployment sessions."""
 
 from __future__ import annotations
 

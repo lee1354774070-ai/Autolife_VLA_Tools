@@ -49,11 +49,12 @@ from std_msgs.msg import String as StringMsg
 
 
 # Allow this script to be copied as a complete /deploy directory while still
-# reusing the camera ABI and canonical schema from the collector.
+# reusing shared deployment helpers, the camera ABI, and the canonical schema.
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_DIR = SCRIPT_DIR.parent
+DEPLOY_DIR = SCRIPT_DIR.parent
+REPO_DIR = DEPLOY_DIR.parent
 COLLECTOR_DIR = REPO_DIR / "lerobot_data_collector"
-for import_dir in (REPO_DIR, COLLECTOR_DIR):
+for import_dir in (DEPLOY_DIR, REPO_DIR, COLLECTOR_DIR):
     if str(import_dir) not in sys.path:
         sys.path.insert(0, str(import_dir))
 
@@ -64,7 +65,7 @@ from camera_config import (  # noqa: E402
     CameraSpec,
 )
 from cli_help import show_requested_parameter_help  # noqa: E402
-from session_control import SessionControl  # noqa: E402
+from common.session_control import SessionControl  # noqa: E402
 from robot_schema import (  # noqa: E402
     RobotSchema,
     build_robot_schema,
@@ -720,6 +721,8 @@ class LocalPI05Deployer:
         self.model_enabled = False
 
         contract_state, contract_action, contract_images, contract_action_names = read_model_contract(args.model_dir)
+        if getattr(args, "ignore_model_image_contract", False):
+            contract_images = {}
         expected_dim = self.schema.size
         if contract_state is not None and contract_state != expected_dim:
             raise ValueError(
@@ -731,7 +734,19 @@ class LocalPI05Deployer:
                 f"Model action has {contract_action} dims, but the selected schema needs {expected_dim}."
             )
         expected_camera_names = tuple(args.camera_names)
-        expected_image_keys = {f"observation.images.{name}" for name in expected_camera_names}
+        policy_camera_keys = tuple(
+            getattr(
+                args,
+                "policy_camera_keys",
+                tuple(f"observation.images.{name}" for name in expected_camera_names),
+            )
+        )
+        if len(policy_camera_keys) != len(expected_camera_names):
+            raise ValueError(
+                "Physical camera names and policy camera keys must have the same length: "
+                f"{len(expected_camera_names)} != {len(policy_camera_keys)}."
+            )
+        expected_image_keys = set(policy_camera_keys)
         if contract_images:
             model_image_keys = set(contract_images)
             if model_image_keys != expected_image_keys:
@@ -748,8 +763,10 @@ class LocalPI05Deployer:
                     + "). Use the cameras used during training or a matching checkpoint."
                 )
             self.image_shapes = {
-                name: normalize_policy_image_shape(contract_images[f"observation.images.{name}"], name)
-                for name in expected_camera_names
+                camera_name: normalize_policy_image_shape(contract_images[policy_key], policy_key)
+                for camera_name, policy_key in zip(
+                    expected_camera_names, policy_camera_keys, strict=True
+                )
             }
         else:
             self.image_shapes = {
@@ -775,11 +792,17 @@ class LocalPI05Deployer:
         self.latest_images: dict[str, np.ndarray] = {}
         self.latest_image_received_sec = 0.0
         self.contract_action_dim = contract_action
+        self.policy_camera_keys = dict(
+            zip(expected_camera_names, policy_camera_keys, strict=True)
+        )
 
     def _print_model_summary(self) -> None:
         print(f"policy schema: {', '.join(self.schema.names)}")
         print(f"policy state/action dimensions: {self.schema.size}/{self.contract_action_dim or 'unknown'}")
-        print(f"camera inputs: {', '.join(self.args.camera_names)}")
+        camera_inputs = ", ".join(
+            f"{name}->{self.policy_camera_keys[name]}" for name in self.args.camera_names
+        )
+        print(f"camera inputs: {camera_inputs}")
         print(f"camera source: direct SHM, reference={self.args.sync_reference_camera}")
         assert self.policy is not None
         print(f"action chunk: size={self.policy.config.chunk_size}, n_action_steps={self.policy.config.n_action_steps}")
@@ -1025,7 +1048,7 @@ class LocalPI05Deployer:
             image = self.latest_images[name]
             if name not in self.args.depth_camera_names:
                 image = image.astype(np.float32, copy=False) / 255.0
-            observation[f"observation.images.{name}"] = torch.from_numpy(image)
+            observation[self.policy_camera_keys[name]] = torch.from_numpy(image)
         return observation
 
     def select_action(self, q23: np.ndarray, task: str) -> np.ndarray:
