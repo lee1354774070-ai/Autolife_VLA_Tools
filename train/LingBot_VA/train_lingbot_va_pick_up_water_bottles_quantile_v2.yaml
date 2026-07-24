@@ -1,0 +1,106 @@
+# LeRobot 0.6.0 / LingBot-VA / 2 x H200 LoRA post-training
+
+dataset:
+  repo_id: local/hotel_pick_v002_depth_pick_up_water_bottles
+  root: /data/dataset/hotel_pick/v002_depth/pick_up_water_bottles/dataset
+  video_backend: pyav
+  return_uint8: true
+  # Hold out the last five episodes for offline loss evaluation.
+  eval_split: 0.1
+
+rename_map:
+  observation.images.rgbd_head_color: observation.images.cam_high
+  observation.images.hand_left: observation.images.cam_left_wrist
+  observation.images.hand_right: observation.images.cam_right_wrist
+
+policy:
+  type: lingbot_va
+  pretrained_path: /data/models/models--lerobot--lingbot_va_base/snapshots/0cbf21e0b2e2eb3a20766a4dd62d1155c2db48f5
+  device: cuda
+  dtype: bfloat16
+  use_amp: false
+  push_to_hub: false
+
+  attn_mode: flex
+  wan_pretrained_path: /data/models/models--robbyant--lingbot-va-base/snapshots/68b7bc1b35da6ddc67ea94c4ceb58d768fbb3f9c
+  text_encoder_device: cpu
+  input_features: null
+
+  obs_cam_keys:
+    - observation.images.cam_high
+    - observation.images.cam_left_wrist
+    - observation.images.cam_right_wrist
+  camera_layout: robotwin_tshape
+  height: 128
+  width: 128
+
+  # Raw joint angles must be mapped into LingBot-VA's model action space.
+  # The dataset already contains q01/q99 for all 16 action dimensions.
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: IDENTITY
+    ACTION: QUANTILES
+
+  # Left arm 7, right arm 7, left gripper, right gripper.
+  used_action_channel_ids:
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    - 21
+    - 22
+    - 23
+    - 24
+    - 25
+    - 26
+    - 27
+    - 28
+    - 29
+
+  action_per_frame: 4
+  frame_chunk_size: 4
+
+  # The 50-episode dataset is small; use the pretrained policy's conservative LR.
+  optimizer_lr: 0.00001
+  optimizer_weight_decay: 0.0001
+  optimizer_grad_clip_norm: 1.0
+  scheduler_warmup_steps: 100
+
+peft:
+  method_type: LORA
+  target_modules: all-linear
+  full_training_modules: []
+  r: 16
+  lora_alpha: 16
+
+output_dir: /data/train_outputs/lingbot_va_pick_up_water_bottles_quantile_v4_bs32_2xh200
+job_name: lingbot_va_pick_up_water_bottles_quantile_v4_bs32_2xh200
+seed: 1000
+
+# Conservative per-GPU batch for long-running H200 training. Batch 42 reached
+# step 200 but later OOMed with less than 100 MiB free, so keep ample headroom
+# at 32. Two workers give a global batch size of 64.
+batch_size: 32
+num_workers: 4
+prefetch_factor: 2
+persistent_workers: true
+
+# 5,000 * 64 = 320,000 samples, about 36.4 passes over the 8,802-frame
+# training split.
+steps: 5000
+log_freq: 10
+save_checkpoint: true
+save_freq: 100
+
+env_eval_freq: 0
+eval_steps: 100
+max_eval_samples: 256
+
+wandb:
+  enable: true
+  project: lingbot-va
+  mode: online
+  notes: "LingBot-VA LoRA post-training on hotel pick-up-water-bottles dataset"

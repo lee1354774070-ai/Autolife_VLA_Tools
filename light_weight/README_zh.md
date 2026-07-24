@@ -71,7 +71,7 @@ policy = load_quantized_policy(
 使用仓库中的量化模型专用入口部署：
 
 ```bash
-python ../deploy/deploy_pi05_light_weight.py \
+python ../deploy/pi05/deploy_pi05_light_weight.py \
   --interactive \
   --model-dir /path/to/pi05_int8wo \
   --tokenizer-dir /path/to/paligemma-tokenizer \

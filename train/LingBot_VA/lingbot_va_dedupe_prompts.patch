@@ -1,0 +1,19 @@
+diff --git a/src/lerobot/policies/lingbot_va/modeling_lingbot_va.py b/src/lerobot/policies/lingbot_va/modeling_lingbot_va.py
+index 1111111..2222222 100644
+--- a/src/lerobot/policies/lingbot_va/modeling_lingbot_va.py
++++ b/src/lerobot/policies/lingbot_va/modeling_lingbot_va.py
+@@ -492,2 +492,8 @@ class LingBotVAPolicy(PreTrainedPolicy):
+         prompt = [prompt] if isinstance(prompt, str) else prompt
+         prompt = [clean_prompt(u) for u in prompt]
++        # A training batch usually repeats the same task string for every
++        # sample. UMT5-XXL is frozen and often runs on CPU, so encode each
++        # distinct prompt once and expand it back to the original batch.
++        unique_prompts = list(dict.fromkeys(prompt))
++        prompt_to_index = {value: index for index, value in enumerate(unique_prompts)}
++        inverse_indices = [prompt_to_index[value] for value in prompt]
+@@ -496 +502 @@ class LingBotVAPolicy(PreTrainedPolicy):
+-            prompt,
++            unique_prompts,
+@@ -514,0 +521,2 @@ class LingBotVAPolicy(PreTrainedPolicy):
++        inverse = torch.as_tensor(inverse_indices, dtype=torch.long, device=prompt_embeds.device)
++        prompt_embeds = prompt_embeds.index_select(0, inverse)

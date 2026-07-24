@@ -16,12 +16,13 @@ from pathlib import Path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_DIR = SCRIPT_DIR.parent
-for import_dir in (SCRIPT_DIR, REPO_DIR):
+DEPLOY_DIR = SCRIPT_DIR.parent
+REPO_DIR = DEPLOY_DIR.parent
+for import_dir in (SCRIPT_DIR, DEPLOY_DIR, REPO_DIR):
     if str(import_dir) not in sys.path:
         sys.path.insert(0, str(import_dir))
 
-import deploy_pi05 as base  # noqa: E402
+from pi05 import deploy_pi05 as base  # noqa: E402
 from light_weight.pi05_quantization import (  # noqa: E402
     load_quantized_policy,
     read_manifest,
