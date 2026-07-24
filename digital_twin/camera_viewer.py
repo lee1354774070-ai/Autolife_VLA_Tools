@@ -28,6 +28,7 @@ CAMERA_LABELS = {
 KNOWN_ROBOT_HOSTS = {
     "283": "192.168.8.42",
     "300": "192.168.8.202",
+    "306": "192.168.8.11",
 }
 FRAME_MAGIC = b"DTCM"
 FRAME_HEADER = struct.Struct("<4sBQI")

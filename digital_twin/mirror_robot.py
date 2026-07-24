@@ -38,6 +38,7 @@ RMW_LIBRARY_NAMES = {
 KNOWN_ROBOT_HOSTS = {
     "283": "192.168.8.42",
     "300": "192.168.8.202",
+    "306": "192.168.8.11",
 }
 
 
@@ -48,7 +49,7 @@ def parse_args() -> argparse.Namespace:
         "--robot-host",
         default=None,
         help=(
-            "Robot SSH host/IP. Known IDs 283 and 300 are resolved automatically; "
+            "Robot SSH host/IP. Known IDs 283, 300, and 306 are resolved automatically; "
             "set this explicitly if an address changes."
         ),
     )

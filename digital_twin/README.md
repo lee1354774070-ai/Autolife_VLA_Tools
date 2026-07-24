@@ -23,14 +23,14 @@ digital_twin/run_digital_twin.sh --robot-id 283
 连接另一台机器人只需更换 ID：
 
 ```bash
-digital_twin/run_digital_twin.sh --robot-id 300
+digital_twin/run_digital_twin.sh --robot-id 306
 ```
 
 默认只打开 Isaac Sim 数字孪生窗口，避免图像编码或机器人视觉服务负载影响
 关节状态链路。需要同时打开独立的 Ubuntu/OpenCV 三路 RGB 窗口时执行：
 
 ```bash
-digital_twin/run_digital_twin.sh --robot-id 300 --camera-viewer
+digital_twin/run_digital_twin.sh --robot-id 306 --camera-viewer
 ```
 
 窗口从上到下依次显示头部彩色相机、左手相机和右手相机。相机查看器通过机器人
@@ -45,6 +45,7 @@ digital_twin/run_digital_twin.sh --robot-id 300 --camera-viewer
 ```text
 283 -> 192.168.8.42
 300 -> 192.168.8.202
+306 -> 192.168.8.11
 ```
 
 这两台机器人将自动使用 SSH 转发状态，因为机器人控制进程的 CycloneDDS
@@ -52,8 +53,8 @@ digital_twin/run_digital_twin.sh --robot-id 300 --camera-viewer
 
 ```bash
 digital_twin/run_digital_twin.sh \
-  --robot-id 300 \
-  --robot-host 192.168.8.202
+  --robot-id 306 \
+  --robot-host 192.168.8.11
 ```
 
 话题按下式自动生成：
@@ -84,14 +85,14 @@ digital_twin/run_digital_twin.sh --robot-id 283 --source target
 
 # 调整地面高度、大小和 RGB 颜色，或不创建地面
 digital_twin/run_digital_twin.sh --robot-id 283 --ground-z -0.02 --ground-size 30
-digital_twin/run_digital_twin.sh --robot-id 300 --ground-color 0.25 0.10 0.45
+digital_twin/run_digital_twin.sh --robot-id 306 --ground-color 0.25 0.10 0.45
 digital_twin/run_digital_twin.sh --robot-id 283 --no-ground
 
 # 同时打开三路相机窗口
-digital_twin/run_digital_twin.sh --robot-id 300 --camera-viewer
+digital_twin/run_digital_twin.sh --robot-id 306 --camera-viewer
 
 # 即使环境变量 SHOW_CAMERAS=1，也强制不打开相机窗口
-digital_twin/run_digital_twin.sh --robot-id 300 --no-camera-viewer
+digital_twin/run_digital_twin.sh --robot-id 306 --no-camera-viewer
 ```
 
 默认地面颜色为蓝色 `RGB=(0.12, 0.32, 0.48)`，每个颜色分量范围是 `0~1`。
@@ -99,14 +100,14 @@ digital_twin/run_digital_twin.sh --robot-id 300 --no-camera-viewer
 也可不启动 Isaac Sim，单独打开三路相机查看器：
 
 ```bash
-digital_twin/run_camera_viewer.sh --robot-id 300
+digital_twin/run_camera_viewer.sh --robot-id 306
 ```
 
 相机查看器常用参数：
 
 ```bash
 digital_twin/run_camera_viewer.sh \
-  --robot-id 300 \
+  --robot-id 306 \
   --fps 15 \
   --jpeg-quality 80 \
   --tile-width 400
